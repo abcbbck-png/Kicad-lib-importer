@@ -29,3 +29,9 @@ create_minimal_test.py
 /tmp/
 *.tmp
 __pycache__/
+
+# KiCad исходники для сборки (большие)
+/kicad-build-src/
+/kicad-src/
+build/
+

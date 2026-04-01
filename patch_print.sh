@@ -1,0 +1,1 @@
+sed -i 's/glyphToFontHeight = static_cast<double>/printf("FONT: %s, height=%ld, units=%ld\\n", m_face->family_name, (long)m_face->height, (long)m_face->units_per_EM); glyphToFontHeight = static_cast<double>/' kicad-build-src/common/font/outline_font.cpp

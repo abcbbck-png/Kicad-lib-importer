@@ -249,7 +249,8 @@ build_kiface() {
 
 # ── Установка ──
 install_kiface() {
-    local src="$1" dst="$2" bak="${dst}.orig"
+    local src="$1" dst="$2"
+    local bak="${dst}.orig"
     [[ ! -f "$bak" ]] && { log "Бэкап → $bak"; sudo cp "$dst" "$bak"; } || ok "Бэкап есть"
     local tmp="/tmp/_eeschema.install.$$"
     cp "$src" "$tmp"
@@ -260,7 +261,8 @@ install_kiface() {
 
 # ── Откат ──
 restore_kiface() {
-    local kiface="$1" bak="${kiface}.orig"
+    local kiface="$1"
+    local bak="${kiface}.orig"
     if [[ -f "$bak" ]]; then
         sudo cp "$bak" "$kiface"
         ok "Восстановлен: $kiface"
