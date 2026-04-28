@@ -1,0 +1,31 @@
+From f8bfa0050d0f77d4b8172dcf71d3886867493419 Mon Sep 17 00:00:00 2001
+From: Anton <a.tsulin@git.kaban4ik.net.ru>
+Date: Wed, 18 Feb 2026 13:58:19 +0300
+Subject: [PATCH 2/5] Fix: don't strip trailing null byte from binary records
+ in Altium parser
+
+ReadProperties() unconditionally stripped trailing 0x00 from record data
+before checking isBinary flag. For binary records (e.g., PinFrac compressed
+data), the trailing 0x00 is part of the zlib payload, not a string terminator.
+This caused ReadFullPascalString() to throw out_of_range, aborting Altium
+.SchLib import for ~1-3% of PinFrac records.
+---
+ common/io/altium/altium_binary_parser.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/common/io/altium/altium_binary_parser.cpp b/common/io/altium/altium_binary_parser.cpp
+index 131e09a391..c1a0ad293d 100644
+--- a/common/io/altium/altium_binary_parser.cpp
++++ b/common/io/altium/altium_binary_parser.cpp
+@@ -382,7 +382,7 @@ std::map<wxString, wxString> ALTIUM_BINARY_PARSER::ReadProperties(
+ 
+     // we use std::string because std::string can handle NULL-bytes
+     // wxString would end the string at the first NULL-byte
+-    std::string str = std::string( m_pos, length - ( hasNullByte ? 1 : 0 ) );
++    std::string str = std::string( m_pos, length - ( ( hasNullByte && !isBinary ) ? 1 : 0 ) );
+     m_pos += length;
+ 
+     if( isBinary )
+-- 
+2.43.0
+

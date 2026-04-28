@@ -3,21 +3,11 @@
 # Python virtual env
 .venv/
 
-# Отладочные артефакты
+# Скомпилированные артефакты
 *.o
 *.so
-gdb_output*.txt
-
-# Большие бинарные SchLib (тестовый в test/)
-IC.SchLib
-Capacitors.SchLib
-Capacitors_test.kicad_sym
-test_bug_nullbyte.SchLib
-
-# Отладочные исходники (не нужны в репо)
-test_crash.cpp
-catch_abort.cpp
-create_minimal_test.py
+test_freetype
+test_gost
 
 # VS Code
 .vscode/
@@ -25,13 +15,22 @@ create_minimal_test.py
 # Copilot instructions (локальные)
 .github/
 
-# Временные файлы сборки
-/tmp/
-*.tmp
+# Python кэш
 __pycache__/
+*.pyc
 
-# KiCad исходники для сборки (большие)
-/kicad-build-src/
+# Временные файлы сборки
+*.tmp
+
+# ── KiCad исходники (большие, скачиваются скриптом) ──
 /kicad-src/
-build/
+
+# ── Кэш собранных артефактов ──
+# Хранится в cache/, но .kiface.meta оставляем для информации
+cache/kicad-*/
+# Старый формат кэша (один файл) — оставляем
+!cache/_eeschema.kiface.*
+
+# ── Бэкап оригинальных системных файлов ──
+cache/*-original/
 

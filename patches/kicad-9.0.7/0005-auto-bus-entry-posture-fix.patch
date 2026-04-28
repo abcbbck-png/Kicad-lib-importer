@@ -1,0 +1,233 @@
+From 906240183219aa276268555865d11aef3ff940ad Mon Sep 17 00:00:00 2001
+From: Anton <a.tsulin@git.kaban4ik.net.ru>
+Date: Wed, 18 Feb 2026 19:32:25 +0300
+Subject: [PATCH 5/5] =?UTF-8?q?Fix=20auto=20bus=20entry:=20handle=20postur?=
+ =?UTF-8?q?e=3Dtrue=20case=20where=2045=C2=B0=20segment=20is=20not=20at=20?=
+ =?UTF-8?q?bus=20end?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ eeschema/tools/sch_line_wire_bus_tool.cpp | 188 ++++++++++++++++++----
+ 1 file changed, 153 insertions(+), 35 deletions(-)
+
+diff --git a/eeschema/tools/sch_line_wire_bus_tool.cpp b/eeschema/tools/sch_line_wire_bus_tool.cpp
+index d4ea1410c9..1643d43d4a 100644
+--- a/eeschema/tools/sch_line_wire_bus_tool.cpp
++++ b/eeschema/tools/sch_line_wire_bus_tool.cpp
+@@ -1174,58 +1174,176 @@ SCH_BUS_WIRE_ENTRY* SCH_LINE_WIRE_BUS_TOOL::tryConvertLastSegmentToBusEntry( SCH
+     if( m_wires.empty() )
+         return nullptr;
+ 
+-    SCH_LINE* lastSeg = m_wires.back();
++    // Helper lambda: check if a segment is a valid 45° candidate and find the bus.
++    // Returns the bus line if found, nullptr otherwise.
++    // aBusEnd receives the point on the bus, aWireEnd receives the wire-side point.
++    auto findDiagonalOnBus = [&]( SCH_LINE* aSeg, VECTOR2I& aBusEnd,
++                                  VECTOR2I& aWireEnd ) -> SCH_LINE*
++    {
++        if( !aSeg || aSeg->GetLayer() != LAYER_WIRE )
++            return nullptr;
+ 
+-    // Only convert wire segments, not bus segments
+-    if( lastSeg->GetLayer() != LAYER_WIRE )
+-        return nullptr;
++        VECTOR2I segStart = aSeg->GetStartPoint();
++        VECTOR2I segEnd   = aSeg->GetEndPoint();
++        VECTOR2I delta    = segEnd - segStart;
+ 
+-    VECTOR2I start = lastSeg->GetStartPoint();
+-    VECTOR2I end   = lastSeg->GetEndPoint();
+-    VECTOR2I delta = end - start;
++        // Must be a diagonal segment (not horizontal or vertical)
++        if( delta.x == 0 || delta.y == 0 )
++            return nullptr;
+ 
+-    // Must be a diagonal segment (not horizontal or vertical)
+-    if( delta.x == 0 || delta.y == 0 )
+-        return nullptr;
++        // Must be exactly 45°
++        if( std::abs( delta.x ) != std::abs( delta.y ) )
++            return nullptr;
+ 
+-    // Must be exactly 45°
+-    if( std::abs( delta.x ) != std::abs( delta.y ) )
+-        return nullptr;
++        int absDx = std::abs( delta.x );
++
++        // Check length constraints: diagonal component between ~0.5mm and 15mm
++        // 0.5 mm → 5000 IU, 15 mm → 150000 IU, divided by sqrt(2)
++        static constexpr int MIN_DIAGONAL_COMPONENT = 3500;    // ~0.5 mm / sqrt(2)
++        static constexpr int MAX_DIAGONAL_COMPONENT = 106066;  // 15 mm / sqrt(2)
++
++        if( absDx < MIN_DIAGONAL_COMPONENT || absDx > MAX_DIAGONAL_COMPONENT )
++            return nullptr;
+ 
+-    // Check length constraints: |dx| must be between 7071 and 106066 IU
+-    // (corresponding to diagonal length between 1 mm and 15 mm)
+-    static constexpr int MIN_DIAGONAL_COMPONENT = 7071;   // 1 mm / sqrt(2)
+-    static constexpr int MAX_DIAGONAL_COMPONENT = 106066; // 15 mm / sqrt(2)
++        // Use a reasonable accuracy for bus detection (half a small grid step)
++        int accuracy = schIUScale.MilsToIU( 5 );
+ 
+-    int absDx = std::abs( delta.x );
++        // Try end point first (most common: diagonal ends at bus)
++        SCH_LINE* bus = aScreen->GetBus( segEnd, accuracy );
++
++        if( bus )
++        {
++            aBusEnd  = bus->GetSeg().NearestPoint( segEnd );
++            aWireEnd = segStart;
++            return bus;
++        }
++
++        // Try start point (inverted posture: diagonal starts at bus)
++        bus = aScreen->GetBus( segStart, accuracy );
++
++        if( bus )
++        {
++            aBusEnd  = bus->GetSeg().NearestPoint( segStart );
++            aWireEnd = segEnd;
++            return bus;
++        }
+ 
+-    if( absDx < MIN_DIAGONAL_COMPONENT || absDx > MAX_DIAGONAL_COMPONENT )
+         return nullptr;
++    };
++
++    // --- Try the last segment first ---
++    SCH_LINE* diagSeg = m_wires.back();
++    int       diagIdx = (int) m_wires.size() - 1;
++    VECTOR2I  busEnd, wireEnd;
++
++    SCH_LINE* bus = findDiagonalOnBus( diagSeg, busEnd, wireEnd );
++
++    // --- If last segment is not diagonal (posture=true), try second-to-last ---
++    if( !bus && m_wires.size() >= 2 )
++    {
++        SCH_LINE* prevSeg = m_wires[m_wires.size() - 2];
++
++        bus = findDiagonalOnBus( prevSeg, busEnd, wireEnd );
++
++        if( bus )
++        {
++            diagSeg = prevSeg;
++            diagIdx = (int) m_wires.size() - 2;
++        }
++    }
+ 
+-    // Check if the end point lands on a bus
+-    SCH_LINE* bus = aScreen->GetBus( end );
++    // --- Case 3: posture=true — last segment is H/V ending on bus,
++    //     second-to-last is 45° but does NOT touch bus.
++    //     Restructure geometry: swap the two segments so the 45° ends at the bus.
++    //     A --45°--> B --H/V--> C(bus) becomes A --H/V--> D --45°--> C(bus)
++    if( !bus && m_wires.size() >= 2 )
++    {
++        SCH_LINE* lastSeg = m_wires.back();
++        SCH_LINE* prevSeg = m_wires[m_wires.size() - 2];
++
++        if( lastSeg && !lastSeg->IsNull() && prevSeg && !prevSeg->IsNull()
++            && lastSeg->GetLayer() == LAYER_WIRE && prevSeg->GetLayer() == LAYER_WIRE )
++        {
++            VECTOR2I lastDelta = lastSeg->GetEndPoint() - lastSeg->GetStartPoint();
++            VECTOR2I prevDelta = prevSeg->GetEndPoint() - prevSeg->GetStartPoint();
++
++            bool lastIsStraight = ( lastDelta.x == 0 || lastDelta.y == 0 );
++            bool prevIs45 = ( prevDelta.x != 0 && prevDelta.y != 0
++                              && std::abs( prevDelta.x ) == std::abs( prevDelta.y ) );
++
++            if( lastIsStraight && prevIs45 )
++            {
++                int      accuracy = schIUScale.MilsToIU( 5 );
++                VECTOR2I lastEnd = lastSeg->GetEndPoint();
++                VECTOR2I lastStart = lastSeg->GetStartPoint();
++
++                // Check if last (straight) segment has an endpoint on a bus
++                SCH_LINE* busLine = aScreen->GetBus( lastEnd, accuracy );
++                VECTOR2I  busPoint = lastEnd;
++
++                if( !busLine )
++                {
++                    busLine = aScreen->GetBus( lastStart, accuracy );
++                    busPoint = lastStart;
++                }
++
++                if( busLine )
++                {
++                    // Restructure: move the 45° to the bus end
++                    int dx_sign = ( prevDelta.x > 0 ) ? 1 : -1;
++                    int dy_sign = ( prevDelta.y > 0 ) ? 1 : -1;
++                    int diag_len = std::abs( prevDelta.x );
++
++                    VECTOR2I D( busPoint.x - dx_sign * diag_len,
++                                busPoint.y - dy_sign * diag_len );
++
++                    prevSeg->SetEndPoint( D );
++                    lastSeg->SetStartPoint( D );
++                    lastSeg->SetEndPoint( busPoint );
++
++                    // Now retry with the restructured last segment
++                    diagSeg = lastSeg;
++                    diagIdx = (int) m_wires.size() - 1;
++                    bus = findDiagonalOnBus( diagSeg, busEnd, wireEnd );
++                }
++            }
++        }
++    }
+ 
+     if( !bus )
+         return nullptr;
+ 
+-    // Snap the end point to the bus
+-    VECTOR2I busPos = bus->GetSeg().NearestPoint( end );
++    // Compute bus entry size vector (from bus position to wire position)
++    VECTOR2I entrySize = wireEnd - busEnd;
+ 
+-    // The wire-side of the bus entry: busPos + (start - end)
+-    VECTOR2I wireEnd = busPos + ( start - end );
++    // Create the bus entry
++    SCH_BUS_WIRE_ENTRY* busEntry = new SCH_BUS_WIRE_ENTRY( busEnd );
++    busEntry->SetSize( entrySize );
++    busEntry->SetParent( &m_frame->Schematic() );
+ 
+-    // Create the bus entry at the bus position
+-    SCH_BUS_WIRE_ENTRY* busEntry = new SCH_BUS_WIRE_ENTRY( busPos );
+-    busEntry->SetSize( start - end );  // Vector from bus to wire side
+-    busEntry->SetParent( aScreen );
++    // Remove the diagonal segment from the wire list
++    m_wires.erase( m_wires.begin() + diagIdx );
++    delete diagSeg;
+ 
+-    // Remove the last wire segment (it's been replaced by the bus entry)
+-    m_wires.pop_back();
+-    delete lastSeg;
++    // If removing the diagonal left a gap, trim the adjacent segment to the wire end
++    if( diagIdx > 0 && diagIdx <= (int) m_wires.size() )
++    {
++        // The segment before the removed one should end at wireEnd
++        m_wires[diagIdx - 1]->SetEndPoint( wireEnd );
++    }
++    else if( diagIdx == 0 && !m_wires.empty() )
++    {
++        // The segment after the removed one should start at wireEnd
++        m_wires[0]->SetStartPoint( wireEnd );
++    }
+ 
+-    // If there's a previous segment, trim its end to the wire side of the bus entry
+-    if( !m_wires.empty() )
+-        m_wires.back()->SetEndPoint( wireEnd );
++    // If the last segment is now null (zero-length, from posture=true case), remove it
++    if( !m_wires.empty() && m_wires.back()->IsNull() )
++    {
++        SCH_LINE* nullSeg = m_wires.back();
++        m_wires.pop_back();
++        delete nullSeg;
++    }
+ 
+     return busEntry;
+ }
+-- 
+2.43.0
+

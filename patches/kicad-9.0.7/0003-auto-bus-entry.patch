@@ -1,0 +1,142 @@
+From da46edce0b94e5f0678683df9b0ad2fde6d8231c Mon Sep 17 00:00:00 2001
+From: Anton <a.tsulin@git.kaban4ik.net.ru>
+Date: Wed, 18 Feb 2026 13:58:29 +0300
+Subject: [PATCH 3/5] =?UTF-8?q?Feature:=20auto-convert=2045=C2=B0=20wire?=
+ =?UTF-8?q?=20segment=20to=20bus=20entry=20on=20bus?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When finishing a wire drawing and the last segment is exactly 45°,
+ends on a bus, and has diagonal length between 1-15mm, automatically
+convert it to SCH_BUS_WIRE_ENTRY with size matching the segment.
+Previous wire segment is trimmed to the wire-side of the bus entry.
+Skipped during bus unfold operations.
+---
+ eeschema/tools/sch_line_wire_bus_tool.cpp | 76 +++++++++++++++++++++++
+ eeschema/tools/sch_line_wire_bus_tool.h   |  8 +++
+ 2 files changed, 84 insertions(+)
+
+diff --git a/eeschema/tools/sch_line_wire_bus_tool.cpp b/eeschema/tools/sch_line_wire_bus_tool.cpp
+index 1d1afdbdda..d4ea1410c9 100644
+--- a/eeschema/tools/sch_line_wire_bus_tool.cpp
++++ b/eeschema/tools/sch_line_wire_bus_tool.cpp
+@@ -1165,6 +1165,72 @@ void SCH_LINE_WIRE_BUS_TOOL::simplifyWireList()
+ }
+ 
+ 
++SCH_BUS_WIRE_ENTRY* SCH_LINE_WIRE_BUS_TOOL::tryConvertLastSegmentToBusEntry( SCH_SCREEN* aScreen )
++{
++    // Don't convert during bus unfold operations
++    if( m_busUnfold.in_progress )
++        return nullptr;
++
++    if( m_wires.empty() )
++        return nullptr;
++
++    SCH_LINE* lastSeg = m_wires.back();
++
++    // Only convert wire segments, not bus segments
++    if( lastSeg->GetLayer() != LAYER_WIRE )
++        return nullptr;
++
++    VECTOR2I start = lastSeg->GetStartPoint();
++    VECTOR2I end   = lastSeg->GetEndPoint();
++    VECTOR2I delta = end - start;
++
++    // Must be a diagonal segment (not horizontal or vertical)
++    if( delta.x == 0 || delta.y == 0 )
++        return nullptr;
++
++    // Must be exactly 45°
++    if( std::abs( delta.x ) != std::abs( delta.y ) )
++        return nullptr;
++
++    // Check length constraints: |dx| must be between 7071 and 106066 IU
++    // (corresponding to diagonal length between 1 mm and 15 mm)
++    static constexpr int MIN_DIAGONAL_COMPONENT = 7071;   // 1 mm / sqrt(2)
++    static constexpr int MAX_DIAGONAL_COMPONENT = 106066; // 15 mm / sqrt(2)
++
++    int absDx = std::abs( delta.x );
++
++    if( absDx < MIN_DIAGONAL_COMPONENT || absDx > MAX_DIAGONAL_COMPONENT )
++        return nullptr;
++
++    // Check if the end point lands on a bus
++    SCH_LINE* bus = aScreen->GetBus( end );
++
++    if( !bus )
++        return nullptr;
++
++    // Snap the end point to the bus
++    VECTOR2I busPos = bus->GetSeg().NearestPoint( end );
++
++    // The wire-side of the bus entry: busPos + (start - end)
++    VECTOR2I wireEnd = busPos + ( start - end );
++
++    // Create the bus entry at the bus position
++    SCH_BUS_WIRE_ENTRY* busEntry = new SCH_BUS_WIRE_ENTRY( busPos );
++    busEntry->SetSize( start - end );  // Vector from bus to wire side
++    busEntry->SetParent( aScreen );
++
++    // Remove the last wire segment (it's been replaced by the bus entry)
++    m_wires.pop_back();
++    delete lastSeg;
++
++    // If there's a previous segment, trim its end to the wire side of the bus entry
++    if( !m_wires.empty() )
++        m_wires.back()->SetEndPoint( wireEnd );
++
++    return busEntry;
++}
++
++
+ void SCH_LINE_WIRE_BUS_TOOL::finishSegments()
+ {
+     // Clear selection when done so that a new wire can be started.
+@@ -1178,6 +1244,9 @@ void SCH_LINE_WIRE_BUS_TOOL::finishSegments()
+     // Remove segments backtracking over others
+     simplifyWireList();
+ 
++    // Try to auto-convert the last 45° wire segment into a bus entry
++    SCH_BUS_WIRE_ENTRY* autoBusEntry = tryConvertLastSegmentToBusEntry( screen );
++
+     // Collect the possible connection points for the new lines
+     std::vector<VECTOR2I> connections = screen->GetConnections();
+     std::vector<VECTOR2I> new_ends;
+@@ -1269,6 +1338,13 @@ void SCH_LINE_WIRE_BUS_TOOL::finishSegments()
+     if( m_busUnfold.in_progress )
+         m_busUnfold = {};
+ 
++    if( autoBusEntry )
++    {
++        autoBusEntry->ClearFlags( IS_NEW );
++        m_frame->AddToScreen( autoBusEntry, screen );
++        commit.Added( autoBusEntry, screen );
++    }
++
+     for( SCH_ITEM* item : m_frame->GetScreen()->Items() )
+         item->ClearEditFlags();
+ 
+diff --git a/eeschema/tools/sch_line_wire_bus_tool.h b/eeschema/tools/sch_line_wire_bus_tool.h
+index 1b19533f48..5ca739147b 100644
+--- a/eeschema/tools/sch_line_wire_bus_tool.h
++++ b/eeschema/tools/sch_line_wire_bus_tool.h
+@@ -148,6 +148,14 @@ private:
+     void computeBreakPoint( const std::pair<SCH_LINE*, SCH_LINE*>& aSegments, VECTOR2I& aPosition,
+                             LINE_MODE mode, bool posture );
+ 
++    /**
++     * Try to convert the last 45° wire segment into a bus entry if it ends on a bus.
++     *
++     * @param aScreen The current schematic screen
++     * @return Pointer to created SCH_BUS_WIRE_ENTRY, or nullptr if conversion not applicable
++     */
++    SCH_BUS_WIRE_ENTRY* tryConvertLastSegmentToBusEntry( SCH_SCREEN* aScreen );
++
+ private:
+     bool                    m_inDrawingTool;   // Reentrancy guard
+ 
+-- 
+2.43.0
+
