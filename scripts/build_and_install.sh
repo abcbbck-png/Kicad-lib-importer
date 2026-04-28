@@ -30,10 +30,15 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PATCHES_DIR="$PROJECT_DIR/patches"
-CACHE_DIR="$PROJECT_DIR/cache"
-SRC_DIR="$PROJECT_DIR/kicad-src"
-KICAD_REPO="https://gitlab.com/kicad/code/kicad.git"
+CACHE_DIR="${CACHE_DIR:-$PROJECT_DIR/cache}"
+SRC_DIR="${SRC_DIR:-$PROJECT_DIR/kicad-src}"
+KICAD_REPO="${KICAD_REPO:-https://gitlab.com/kicad/code/kicad.git}"
 JOBS=$(nproc 2>/dev/null || echo 4)
+CACHE_FORMAT_VERSION=2
+KICAD_INSTALL_PREFIX="${KICAD_INSTALL_PREFIX:-/usr}"
+MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
+SYSTEM_LIB_DIR="/usr/lib/$MULTIARCH"
+SYSTEM_SHARE_DIR="/usr/share"
 
 # ── Режимы ────────────────────────────────────────────────────────────────
 MODE_CHECK=false        # dry-run
@@ -50,6 +55,15 @@ err()    { echo -e "${RED}[FAIL]${NC} $*" >&2; }
 die()    { err "$*"; exit 1; }
 header() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 ask()    { echo -e "${YELLOW}[?]${NC} $*"; }
+
+sudo_atomic_copy() {
+    local src="$1" dst="$2" tmp
+    tmp="${dst}.tmp.$$"
+
+    sudo rm -f "$tmp"
+    sudo cp -aP "$src" "$tmp"
+    sudo mv -f "$tmp" "$dst"
+}
 
 # ── Помощь ────────────────────────────────────────────────────────────────
 show_help() {
@@ -80,6 +94,8 @@ show_help() {
   KICAD_REPO   URL репозитория (по умолчанию: gitlab.com/kicad/code/kicad.git)
   SRC_DIR      Путь к исходникам KiCad (по умолчанию: ./kicad-src/)
   CACHE_DIR    Путь к кэшу (по умолчанию: ./cache/)
+  KICAD_INSTALL_PREFIX
+               Runtime prefix KiCad (по умолчанию: /usr)
 
 ПРИМЕРЫ:
   ./scripts/build_and_install.sh --check         # что будет установлено?
@@ -155,8 +171,9 @@ find_patch_dir() {
     local version="$1"
     local exact="$PATCHES_DIR/kicad-$version"
 
-    if [[ -d "$exact" ]] && compgen -G "$exact"/*.patch &>/dev/null 2>&1 || \
-       compgen -G "$exact"/*.diff &>/dev/null 2>&1; then
+    if [[ -d "$exact" ]] \
+       && { compgen -G "$exact"/*.patch &>/dev/null 2>&1 \
+            || compgen -G "$exact"/*.diff &>/dev/null 2>&1; }; then
         echo "$exact"
         return 0
     fi
@@ -195,8 +212,17 @@ list_patches() {
 # ── Хэш набора патчей ─────────────────────────────────────────────────────
 compute_hash() {
     local patch_dir="$1"
-    # Хэш от содержимого всех патчей + их порядка
-    list_patches "$patch_dir" | xargs cat 2>/dev/null | md5sum | awk '{print $1}' | head -c 12
+    # Хэш от содержимого всех патчей + их порядка + формата кэша.
+    # Старый формат собирался с CMAKE_INSTALL_PREFIX=cache/... и ломал
+    # runtime-пути к /usr/share/kicad.
+    {
+        echo "cache_format=$CACHE_FORMAT_VERSION"
+        echo "install_prefix=$KICAD_INSTALL_PREFIX"
+        list_patches "$patch_dir" | while IFS= read -r patch; do
+            echo "patch=$(basename "$patch")"
+            cat "$patch"
+        done
+    } | md5sum | awk '{print $1}' | head -c 12
 }
 
 # ── Путь к кэшу ───────────────────────────────────────────────────────────
@@ -411,11 +437,14 @@ apply_patches() {
         if patch "${patch_args[@]}" < "$p" &>/dev/null 2>&1; then
             echo -e "${GREEN}✓${NC}"
         else
-            echo -e "${RED}✗${NC}"
-            if $dry; then
+            if $dry && patch -R -p1 --directory="$src" --dry-run < "$p" &>/dev/null 2>&1; then
+                echo -e "${YELLOW}уже применён${NC}"
+            elif $dry; then
+                echo -e "${RED}✗${NC}"
                 warn "Патч несовместим: $name"
-                warn "Возможно, он уже применён или версия KiCad не совпадает."
+                warn "Возможно, версия KiCad не совпадает."
             else
+                echo -e "${RED}✗${NC}"
                 # Попробуем показать детали
                 patch "${patch_args[@]}" < "$p" 2>&1 | tail -5 || true
                 die "Патч не применился: $name"
@@ -427,11 +456,12 @@ apply_patches() {
 
 # ── Сборка KiCad ─────────────────────────────────────────────────────────
 build_kicad() {
-    local src="$1" install_prefix="$2"
+    local src="$1" stage_dir="$2"
 
     header "Сборка KiCad"
     log "Источник:  $src"
-    log "Установка: $install_prefix"
+    log "Prefix:    $KICAD_INSTALL_PREFIX"
+    log "Staging:   $stage_dir"
     log "Потоки:    $JOBS"
     echo ""
 
@@ -440,10 +470,13 @@ build_kicad() {
     log "Конфигурация CMake..."
     cmake -S "$src" -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$install_prefix" \
+        -DCMAKE_INSTALL_PREFIX="$KICAD_INSTALL_PREFIX" \
+        -DCMAKE_INSTALL_LIBDIR="lib/$MULTIARCH" \
         -DKICAD_SCRIPTING_WXPYTHON=ON \
         -DKICAD_USE_OCC=ON \
         -DKICAD_SPICE=ON \
+        -DKICAD_BUILD_I18N=ON \
+        -DKICAD_BUILD_QA_TESTS=OFF \
         -DKICAD_USE_CMAKE_FINDPROTOBUF=ON \
         -GNinja \
         2>&1 | grep -E "(CMake Warning|CMake Error|-- Build|-- Install|error:)" | head -30
@@ -458,12 +491,13 @@ build_kicad() {
     local elapsed=$(( SECONDS - start ))
     ok "Сборка завершена за $(( elapsed / 60 ))м $(( elapsed % 60 ))с"
 
-    log "Установка в кэш..."
-    cmake --install "$build_dir" 2>&1 | grep -v "^-- Up-to-date" | tail -20
-    ok "Установлено в: $install_prefix"
+    log "Установка в staging-кэш..."
+    rm -rf "$stage_dir$KICAD_INSTALL_PREFIX"
+    DESTDIR="$stage_dir" cmake --install "$build_dir" 2>&1 | grep -v "^-- Up-to-date" | tail -20
+    ok "Установлено в: $stage_dir$KICAD_INSTALL_PREFIX"
 
     log "Stripping символов (как в релизных пакетах Ubuntu)..."
-    find "$install_prefix" -type f \( -name "*.kiface" -o -name "*.so" -o -name "*.so.*" \
+    find "$stage_dir$KICAD_INSTALL_PREFIX" -type f \( -name "*.kiface" -o -name "*.so" -o -name "*.so.*" \
         -o -name "kicad" -o -name "kicad-cli" -o -name "eeschema" -o -name "pcbnew" \
         -o -name "gerbview" -o -name "pcb_calculator" -o -name "pl_editor" \
         -o -name "bitmap2component" \) \
@@ -473,38 +507,91 @@ build_kicad() {
 
 # ── Резервная копия системных файлов KiCad ──────────────────────────
 backup_originals() {
-    local version="$1" system_kicad="$2"
+    local version="$1" system_kicad="$2" cache_install="${3:-}"
     local backup_dir
     backup_dir=$(cache_original_dir "$version")
 
     if [[ -d "$backup_dir" ]]; then
         ok "Резервная копия уже есть: $backup_dir"
-        return
+        log "Досохраняю отсутствующие resource/plugin файлы, если они нужны..."
+    else
+        header "Резервная копия оригинальных файлов KiCad"
     fi
 
-    header "Резервная копия оригинальных файлов KiCad"
-    mkdir -p "$backup_dir/bin" "$backup_dir/lib"
+    mkdir -p "$backup_dir/bin" "$backup_dir/lib" "$backup_dir/plugins" \
+             "$backup_dir/python" "$backup_dir/share/kicad"
+
+    local stage_root cache_bin cache_lib cache_plugins cache_python cache_share
+
+    if [[ -n "$cache_install" ]]; then
+        stage_root="$cache_install$KICAD_INSTALL_PREFIX"
+        cache_bin="$stage_root/bin"
+        cache_lib="$stage_root/lib/$MULTIARCH"
+        [[ -d "$cache_lib" ]] || cache_lib="$stage_root/lib"
+        cache_plugins="$cache_lib/kicad/plugins"
+        cache_python="$stage_root/lib/python3/dist-packages"
+        cache_share="$stage_root/share"
+    else
+        cache_bin=$(find "$CACHE_DIR" -maxdepth 3 -path "*/bin" -not -path "*original*" 2>/dev/null | head -1)
+        cache_lib=$(find "$CACHE_DIR" -maxdepth 4 -path "*/lib/$MULTIARCH" -not -path "*original*" 2>/dev/null | head -1)
+        [[ -n "$cache_lib" ]] || cache_lib=$(find "$CACHE_DIR" -maxdepth 3 -path "*/lib" -not -path "*original*" 2>/dev/null | head -1)
+        cache_plugins="$cache_lib/kicad/plugins"
+        cache_python="$(dirname "$cache_lib")/python3/dist-packages"
+        cache_share="$(dirname "$cache_lib")/share"
+    fi
 
     # Бэкапим бинари из system_kicad (только то что есть в нашем кэше)
-    local cache_bin="$CACHE_DIR/kicad-${version}-"*"/bin"
-    cache_bin=$(find "$CACHE_DIR" -maxdepth 2 -name "bin" -not -path "*original*" 2>/dev/null | head -1)
     if [[ -n "$cache_bin" && -d "$cache_bin" ]]; then
         log "Бэкап бинарей из: $system_kicad"
         for f in "$cache_bin"/*; do
             local name; name=$(basename "$f")
-            [[ -f "$system_kicad/$name" ]] && cp -v "$system_kicad/$name" "$backup_dir/bin/"
+            [[ -f "$system_kicad/$name" && ! -e "$backup_dir/bin/$name" ]] \
+                && cp -v "$system_kicad/$name" "$backup_dir/bin/"
         done
     fi
 
     # Бэкапим shared libs (libkigal, libkicommon, libkiapi, libkicad_3dsg)
-    local sys_lib="/usr/lib/x86_64-linux-gnu"
-    log "Бэкап shared libs из: $sys_lib"
-    local cache_lib
-    cache_lib=$(find "$CACHE_DIR" -maxdepth 2 -name "lib" -not -path "*original*" 2>/dev/null | head -1)
+    log "Бэкап shared libs из: $SYSTEM_LIB_DIR"
     if [[ -n "$cache_lib" && -d "$cache_lib" ]]; then
         for f in "$cache_lib"/libki*.so*; do
+            [[ -e "$f" || -L "$f" ]] || continue
             local name; name=$(basename "$f")
-            [[ -f "$sys_lib/$name" ]] && cp -v "$sys_lib/$name" "$backup_dir/lib/"
+            [[ ( -e "$SYSTEM_LIB_DIR/$name" || -L "$SYSTEM_LIB_DIR/$name" ) && ! -e "$backup_dir/lib/$name" ]] \
+                && cp -av "$SYSTEM_LIB_DIR/$name" "$backup_dir/lib/"
+        done
+    fi
+
+    if [[ -n "$cache_plugins" && -d "$cache_plugins" ]]; then
+        log "Бэкап KiCad plugins из: $SYSTEM_LIB_DIR/kicad/plugins"
+        while IFS= read -r -d '' f; do
+            local rel="${f#$cache_plugins/}"
+            local sys_file="$SYSTEM_LIB_DIR/kicad/plugins/$rel"
+            local dst="$backup_dir/plugins/$rel"
+            [[ -e "$sys_file" || -L "$sys_file" ]] || continue
+            mkdir -p "$(dirname "$dst")"
+            [[ ! -e "$dst" ]] && cp -av "$sys_file" "$dst"
+        done < <(find "$cache_plugins" -type f -print0)
+    fi
+
+    if [[ -n "$cache_python" && -d "$cache_python" ]]; then
+        log "Бэкап Python-модулей KiCad"
+        for f in "$cache_python"/*; do
+            [[ -e "$f" ]] || continue
+            local name; name=$(basename "$f")
+            local sys_file="/usr/lib/python3/dist-packages/$name"
+            [[ -e "$sys_file" && ! -e "$backup_dir/python/$name" ]] \
+                && cp -av "$sys_file" "$backup_dir/python/"
+        done
+    fi
+
+    if [[ -n "$cache_share" && -d "$cache_share/kicad" ]]; then
+        log "Бэкап KiCad share resources"
+        local share_dirs=(internat resources schemas scripting template plugins)
+        for d in "${share_dirs[@]}"; do
+            [[ -d "$cache_share/kicad/$d" ]] || continue
+            [[ -d "$SYSTEM_SHARE_DIR/kicad/$d" ]] || continue
+            [[ -d "$backup_dir/share/kicad/$d" ]] && continue
+            cp -av "$SYSTEM_SHARE_DIR/kicad/$d" "$backup_dir/share/kicad/"
         done
     fi
 
@@ -516,12 +603,20 @@ backup_originals() {
 # ── Установка из кэша в систему ───────────────────────────────────────────
 install_from_cache() {
     local cache_install="$1" system_kicad="$2"
-    local sys_lib="/usr/lib/x86_64-linux-gnu"
+    local stage_root="$cache_install$KICAD_INSTALL_PREFIX"
 
     header "Установка в систему"
 
-    local cache_bin="$cache_install/bin"
-    local cache_lib="$cache_install/lib"
+    if [[ ! -d "$stage_root/bin" ]]; then
+        die "Кэш старого формата или повреждён: $cache_install\nПересоберите: ./scripts/build_and_install.sh --rebuild"
+    fi
+
+    local cache_bin="$stage_root/bin"
+    local cache_lib="$stage_root/lib/$MULTIARCH"
+    [[ -d "$cache_lib" ]] || cache_lib="$stage_root/lib"
+    local cache_plugins="$cache_lib/kicad/plugins"
+    local cache_python="$stage_root/lib/python3/dist-packages"
+    local cache_share="$stage_root/share"
 
     [[ -d "$cache_bin" ]] || die "В кэше нет директории bin: $cache_bin"
 
@@ -537,16 +632,40 @@ install_from_cache() {
     local lib_files=()
     if [[ -d "$cache_lib" ]]; then
         for f in "$cache_lib"/libki*.so*; do
+            [[ -e "$f" || -L "$f" ]] || continue
             local name; name=$(basename "$f")
-            [[ -f "$sys_lib/$name" ]] && lib_files+=("$f")
+            [[ -e "$SYSTEM_LIB_DIR/$name" || -L "$SYSTEM_LIB_DIR/$name" ]] && lib_files+=("$f")
+        done
+    fi
+
+    local plugin_files=()
+    if [[ -d "$cache_plugins" ]]; then
+        while IFS= read -r -d '' f; do plugin_files+=("$f"); done < <(find "$cache_plugins" -type f -print0 | sort -z)
+    fi
+
+    local python_files=()
+    if [[ -d "$cache_python" ]]; then
+        for f in "$cache_python"/*; do [[ -e "$f" ]] && python_files+=("$f"); done
+    fi
+
+    local share_dirs=()
+    if [[ -d "$cache_share/kicad" ]]; then
+        for d in internat resources schemas scripting template plugins; do
+            [[ -d "$cache_share/kicad/$d" ]] && share_dirs+=("$d")
         done
     fi
 
     log "Будет установлено бинарей:      ${#bin_files[@]} → $system_kicad"
-    log "Будет установлено shared libs:  ${#lib_files[@]} → $sys_lib"
+    log "Будет установлено shared libs:  ${#lib_files[@]} → $SYSTEM_LIB_DIR"
+    log "Будет установлено plugins:      ${#plugin_files[@]} → $SYSTEM_LIB_DIR/kicad/plugins"
+    log "Будет установлено python:       ${#python_files[@]} → /usr/lib/python3/dist-packages"
+    log "Будет обновлено share/kicad:    ${#share_dirs[@]} директорий"
     echo ""
     for f in "${bin_files[@]}"; do printf "  bin/%s\n" "$(basename "$f")"; done
     for f in "${lib_files[@]}"; do printf "  lib/%s\n" "$(basename "$f")"; done
+    for f in "${plugin_files[@]}"; do printf "  plugin/%s\n" "${f#$cache_plugins/}"; done
+    for f in "${python_files[@]}"; do printf "  python/%s\n" "$(basename "$f")"; done
+    for d in "${share_dirs[@]}"; do printf "  share/kicad/%s/\n" "$d"; done
     echo ""
 
     if $MODE_CHECK; then
@@ -554,9 +673,38 @@ install_from_cache() {
         return
     fi
 
-    sudo cp -v "${bin_files[@]}" "$system_kicad/"
+    for f in "${bin_files[@]}"; do
+        echo "'$f' -> '$system_kicad/$(basename "$f")'"
+        sudo_atomic_copy "$f" "$system_kicad/$(basename "$f")"
+    done
     if [[ ${#lib_files[@]} -gt 0 ]]; then
-        sudo cp -v "${lib_files[@]}" "$sys_lib/"
+        for f in "${lib_files[@]}"; do
+            echo "'$f' -> '$SYSTEM_LIB_DIR/$(basename "$f")'"
+            sudo_atomic_copy "$f" "$SYSTEM_LIB_DIR/$(basename "$f")"
+        done
+    fi
+    if [[ ${#plugin_files[@]} -gt 0 ]]; then
+        sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins"
+        for f in "${plugin_files[@]}"; do
+            local rel="${f#$cache_plugins/}"
+            sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins/$(dirname "$rel")"
+            sudo_atomic_copy "$f" "$SYSTEM_LIB_DIR/kicad/plugins/$rel"
+        done
+    fi
+    if [[ ${#python_files[@]} -gt 0 ]]; then
+        sudo mkdir -p /usr/lib/python3/dist-packages
+        for f in "${python_files[@]}"; do
+            sudo_atomic_copy "$f" "/usr/lib/python3/dist-packages/$(basename "$f")"
+        done
+    fi
+    if [[ ${#share_dirs[@]} -gt 0 ]]; then
+        sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad"
+        for d in "${share_dirs[@]}"; do
+            sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad/$d"
+            sudo cp -av "$cache_share/kicad/$d/." "$SYSTEM_SHARE_DIR/kicad/$d/"
+        done
+    fi
+    if [[ ${#lib_files[@]} -gt 0 || ${#plugin_files[@]} -gt 0 ]]; then
         sudo ldconfig
     fi
     ok "Установка завершена"
@@ -565,7 +713,7 @@ install_from_cache() {
 # ── Откат к оригинальным файлам ───────────────────────────────────────────
 restore_originals() {
     local version="$1" system_kicad="$2"
-    local backup_dir sys_lib="/usr/lib/x86_64-linux-gnu"
+    local backup_dir
     backup_dir=$(cache_original_dir "$version")
 
     header "Откат к оригинальным файлам KiCad $version"
@@ -577,19 +725,63 @@ restore_originals() {
     mapfile -t bin_files < <(find "$backup_dir/bin" -type f 2>/dev/null | sort)
     if [[ ${#bin_files[@]} -gt 0 ]]; then
         log "Восстановление бинарей → $system_kicad"
-        sudo cp -v "${bin_files[@]}" "$system_kicad/"
+        for f in "${bin_files[@]}"; do
+            echo "'$f' -> '$system_kicad/$(basename "$f")'"
+            sudo_atomic_copy "$f" "$system_kicad/$(basename "$f")"
+        done
     fi
 
     # Восстанавливаем shared libs
     local lib_files=()
     mapfile -t lib_files < <(find "$backup_dir/lib" -type f 2>/dev/null | sort)
     if [[ ${#lib_files[@]} -gt 0 ]]; then
-        log "Восстановление shared libs → $sys_lib"
-        sudo cp -v "${lib_files[@]}" "$sys_lib/"
+        log "Восстановление shared libs → $SYSTEM_LIB_DIR"
+        for f in "${lib_files[@]}"; do
+            echo "'$f' -> '$SYSTEM_LIB_DIR/$(basename "$f")'"
+            sudo_atomic_copy "$f" "$SYSTEM_LIB_DIR/$(basename "$f")"
+        done
         sudo ldconfig
     fi
 
-    [[ ${#bin_files[@]} -gt 0 || ${#lib_files[@]} -gt 0 ]] || die "В бэкапе нет файлов"
+    if [[ -d "$backup_dir/plugins" ]]; then
+        local plugin_files=()
+        mapfile -t plugin_files < <(find "$backup_dir/plugins" -type f 2>/dev/null | sort)
+        if [[ ${#plugin_files[@]} -gt 0 ]]; then
+            log "Восстановление plugins → $SYSTEM_LIB_DIR/kicad/plugins"
+            for f in "${plugin_files[@]}"; do
+                local rel="${f#$backup_dir/plugins/}"
+                sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins/$(dirname "$rel")"
+                sudo_atomic_copy "$f" "$SYSTEM_LIB_DIR/kicad/plugins/$rel"
+            done
+            sudo ldconfig
+        fi
+    fi
+
+    if [[ -d "$backup_dir/python" ]]; then
+        local python_files=()
+        mapfile -t python_files < <(find "$backup_dir/python" -type f 2>/dev/null | sort)
+        if [[ ${#python_files[@]} -gt 0 ]]; then
+            log "Восстановление Python-модулей → /usr/lib/python3/dist-packages"
+            for f in "${python_files[@]}"; do
+                sudo_atomic_copy "$f" "/usr/lib/python3/dist-packages/$(basename "$f")"
+            done
+        fi
+    fi
+
+    if [[ -d "$backup_dir/share/kicad" ]]; then
+        local share_dirs=()
+        mapfile -t share_dirs < <(find "$backup_dir/share/kicad" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+        if [[ ${#share_dirs[@]} -gt 0 ]]; then
+            log "Восстановление share/kicad resources"
+            for d in "${share_dirs[@]}"; do
+                local name; name=$(basename "$d")
+                sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad/$name"
+                sudo cp -av "$d/." "$SYSTEM_SHARE_DIR/kicad/$name/"
+            done
+        fi
+    fi
+
+    [[ ${#bin_files[@]} -gt 0 || ${#lib_files[@]} -gt 0 || -d "$backup_dir/share/kicad" ]] || die "В бэкапе нет файлов"
     ok "Оригинальные файлы восстановлены"
 }
 
@@ -618,6 +810,39 @@ verify_installation() {
         fi
     done
     [[ $bad -eq 0 ]] && ok "Все .kiface файлы — валидные ELF" || die "$bad повреждённых файлов после установки"
+
+    # 2.5. Проверяем критичные runtime-ресурсы. Они поставляются отдельными
+    # пакетами KiCad, но собранные бинарники обязаны искать их в /usr/share/kicad.
+    local resource_errors=0
+
+    if [[ -f "$SYSTEM_SHARE_DIR/kicad/internat/ru/kicad.mo" ]]; then
+        ok "Локализации найдены: $SYSTEM_SHARE_DIR/kicad/internat"
+    else
+        err "Не найдены локализации KiCad: $SYSTEM_SHARE_DIR/kicad/internat"
+        ((resource_errors++))
+    fi
+
+    local footprint_count=0 symbol_count=0
+    [[ -d "$SYSTEM_SHARE_DIR/kicad/footprints" ]] \
+        && footprint_count=$(find "$SYSTEM_SHARE_DIR/kicad/footprints" -mindepth 1 -maxdepth 1 -type d | wc -l)
+    [[ -d "$SYSTEM_SHARE_DIR/kicad/symbols" ]] \
+        && symbol_count=$(find "$SYSTEM_SHARE_DIR/kicad/symbols" -maxdepth 1 -type f -name '*.kicad_sym' | wc -l)
+
+    if [[ $footprint_count -gt 50 ]]; then
+        ok "Footprint libraries: $footprint_count"
+    else
+        err "Подозрительно мало footprint libraries: $footprint_count"
+        ((resource_errors++))
+    fi
+
+    if [[ $symbol_count -gt 50 ]]; then
+        ok "Symbol libraries: $symbol_count"
+    else
+        err "Подозрительно мало symbol libraries: $symbol_count"
+        ((resource_errors++))
+    fi
+
+    [[ $resource_errors -eq 0 ]] || die "Проверка KiCad runtime-ресурсов не пройдена"
 
     # 3. Функциональный тест — импорт тестового файла
     local tests_dir
@@ -662,6 +887,9 @@ save_cache_meta() {
 version=$version
 patches_hash=$hash
 patch_dir=$patch_dir
+cache_format=$CACHE_FORMAT_VERSION
+install_prefix=$KICAD_INSTALL_PREFIX
+multiarch=$MULTIARCH
 built=$(date -Iseconds)
 builder=$(gcc --version 2>/dev/null | head -1)
 jobs=$JOBS
@@ -772,7 +1000,7 @@ main() {
     fi
 
     # ── 9. Резервная копия ──
-    backup_originals "$version" "$system_kicad"
+    backup_originals "$version" "$system_kicad" "$cache_install"
 
     # ── 10. Установка ──
     install_from_cache "$cache_install" "$system_kicad"
