@@ -1,0 +1,40 @@
+diff --git a/eeschema/sch_painter.cpp b/eeschema/sch_painter.cpp
+index 8d8a8d66..0a7d67fc 100644
+--- a/eeschema/sch_painter.cpp
++++ b/eeschema/sch_painter.cpp
+@@ -2308,6 +2308,14 @@ void SCH_PAINTER::draw( const SCH_FIELD* aField, int aLayer, bool aDimmed )
+ 
+     TEXT_ATTRIBUTES attributes = aField->GetAttributes();
+     attributes.m_StrokeWidth = KiROUND( getTextThickness( aField ) );
++    VECTOR2I textpos = bbox.Centre();
++
++    attributes.m_Halign = GR_TEXT_H_ALIGN_CENTER;
++    attributes.m_Valign = GR_TEXT_V_ALIGN_CENTER;
++    attributes.m_Angle = orient;
++
++    if( drawingShadows )
++        attributes.m_StrokeWidth += getShadowWidth( !aField->IsSelected() );
+ 
+     m_gal->SetStrokeColor( color );
+     m_gal->SetFillColor( color );
+@@ -2315,19 +2323,10 @@ void SCH_PAINTER::draw( const SCH_FIELD* aField, int aLayer, bool aDimmed )
+     if( drawingShadows && getFont( aField )->IsOutline() )
+     {
+         // Trying to draw glyph-shaped shadows on outline text is a fool's errand.  Just box it.
+-        boxText( *m_gal, shownText, aField->GetDrawPos(), attributes, aField->GetFontMetrics() );
++        boxText( *m_gal, shownText, textpos, attributes, aField->GetFontMetrics() );
+     }
+     else
+     {
+-        VECTOR2I textpos = bbox.Centre();
+-
+-        attributes.m_Halign = GR_TEXT_H_ALIGN_CENTER;
+-        attributes.m_Valign = GR_TEXT_V_ALIGN_CENTER;
+-        attributes.m_Angle = orient;
+-
+-        if( drawingShadows )
+-            attributes.m_StrokeWidth += getShadowWidth( !aField->IsSelected() );
+-
+         if( aField->IsHypertext() && aField->IsRollover() && !aField->IsMoving() )
+         {
+             m_gal->SetStrokeColor( m_schSettings.GetLayerColor( LAYER_HOVERED ) );
