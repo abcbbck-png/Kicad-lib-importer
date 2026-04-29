@@ -34,9 +34,15 @@ CACHE_DIR="${CACHE_DIR:-$PROJECT_DIR/cache}"
 SRC_DIR="${SRC_DIR:-$PROJECT_DIR/kicad-src}"
 KICAD_REPO="${KICAD_REPO:-https://gitlab.com/kicad/code/kicad.git}"
 JOBS=$(nproc 2>/dev/null || echo 4)
-CACHE_FORMAT_VERSION=2
+CACHE_FORMAT_VERSION=4
 KICAD_INSTALL_PREFIX="${KICAD_INSTALL_PREFIX:-/usr}"
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
+KICAD_INSTALL_LIBDIR="${KICAD_INSTALL_LIBDIR:-lib/$MULTIARCH}"
+KICAD_DATA_DIR="${KICAD_DATA_DIR:-$KICAD_INSTALL_PREFIX/share/kicad}"
+KICAD_LIBRARY_DATA_DIR="${KICAD_LIBRARY_DATA_DIR:-$KICAD_DATA_DIR}"
+KICAD_DOCS_DIR="${KICAD_DOCS_DIR:-$KICAD_INSTALL_PREFIX/share/doc/kicad}"
+KICAD_LIB_DIR="${KICAD_LIB_DIR:-$KICAD_INSTALL_PREFIX/$KICAD_INSTALL_LIBDIR}"
+KICAD_USER_PLUGIN_DIR="${KICAD_USER_PLUGIN_DIR:-$KICAD_LIB_DIR/kicad/plugins}"
 SYSTEM_LIB_DIR="/usr/lib/$MULTIARCH"
 SYSTEM_SHARE_DIR="/usr/share"
 
@@ -96,6 +102,8 @@ show_help() {
   CACHE_DIR    Путь к кэшу (по умолчанию: ./cache/)
   KICAD_INSTALL_PREFIX
                Runtime prefix KiCad (по умолчанию: /usr)
+  KICAD_INSTALL_LIBDIR
+               Runtime libdir относительно prefix (по умолчанию: lib/<multiarch>)
 
 ПРИМЕРЫ:
   ./scripts/build_and_install.sh --check         # что будет установлено?
@@ -218,6 +226,12 @@ compute_hash() {
     {
         echo "cache_format=$CACHE_FORMAT_VERSION"
         echo "install_prefix=$KICAD_INSTALL_PREFIX"
+        echo "install_libdir=$KICAD_INSTALL_LIBDIR"
+        echo "kicad_data=$KICAD_DATA_DIR"
+        echo "kicad_library_data=$KICAD_LIBRARY_DATA_DIR"
+        echo "kicad_docs=$KICAD_DOCS_DIR"
+        echo "kicad_lib=$KICAD_LIB_DIR"
+        echo "kicad_user_plugin=$KICAD_USER_PLUGIN_DIR"
         list_patches "$patch_dir" | while IFS= read -r patch; do
             echo "patch=$(basename "$patch")"
             cat "$patch"
@@ -437,7 +451,7 @@ apply_patches() {
         if patch "${patch_args[@]}" < "$p" &>/dev/null 2>&1; then
             echo -e "${GREEN}✓${NC}"
         else
-            if $dry && patch -R -p1 --directory="$src" --dry-run < "$p" &>/dev/null 2>&1; then
+            if patch -R -p1 --directory="$src" --dry-run < "$p" &>/dev/null 2>&1; then
                 echo -e "${YELLOW}уже применён${NC}"
             elif $dry; then
                 echo -e "${RED}✗${NC}"
@@ -461,17 +475,33 @@ build_kicad() {
     header "Сборка KiCad"
     log "Источник:  $src"
     log "Prefix:    $KICAD_INSTALL_PREFIX"
+    log "Data:      $KICAD_DATA_DIR"
+    log "Libdir:    $KICAD_LIB_DIR"
     log "Staging:   $stage_dir"
     log "Потоки:    $JOBS"
     echo ""
 
     local build_dir="$src/build"
 
+    if [[ -f "$build_dir/CMakeCache.txt" ]]; then
+        log "Очищаю старый CMakeCache, чтобы не сохранить прежние runtime-пути..."
+        rm -f "$build_dir/CMakeCache.txt"
+        rm -rf "$build_dir/CMakeFiles"
+    fi
+
     log "Конфигурация CMake..."
     cmake -S "$src" -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$KICAD_INSTALL_PREFIX" \
-        -DCMAKE_INSTALL_LIBDIR="lib/$MULTIARCH" \
+        -DCMAKE_INSTALL_LIBDIR="$KICAD_INSTALL_LIBDIR" \
+        -DKICAD_DATA="$KICAD_DATA_DIR" \
+        -DKICAD_LIBRARY_DATA="$KICAD_LIBRARY_DATA_DIR" \
+        -DKICAD_DOCS="$KICAD_DOCS_DIR" \
+        -DKICAD_PLUGINS="$KICAD_DATA_DIR/plugins" \
+        -DKICAD_DEMOS="$KICAD_DATA_DIR/demos" \
+        -DKICAD_TEMPLATE="$KICAD_LIBRARY_DATA_DIR/template" \
+        -DKICAD_LIB="$KICAD_LIB_DIR" \
+        -DKICAD_USER_PLUGIN="$KICAD_USER_PLUGIN_DIR" \
         -DKICAD_SCRIPTING_WXPYTHON=ON \
         -DKICAD_USE_OCC=ON \
         -DKICAD_SPICE=ON \
@@ -526,14 +556,14 @@ backup_originals() {
     if [[ -n "$cache_install" ]]; then
         stage_root="$cache_install$KICAD_INSTALL_PREFIX"
         cache_bin="$stage_root/bin"
-        cache_lib="$stage_root/lib/$MULTIARCH"
+        cache_lib="$stage_root/$KICAD_INSTALL_LIBDIR"
         [[ -d "$cache_lib" ]] || cache_lib="$stage_root/lib"
         cache_plugins="$cache_lib/kicad/plugins"
         cache_python="$stage_root/lib/python3/dist-packages"
         cache_share="$stage_root/share"
     else
         cache_bin=$(find "$CACHE_DIR" -maxdepth 3 -path "*/bin" -not -path "*original*" 2>/dev/null | head -1)
-        cache_lib=$(find "$CACHE_DIR" -maxdepth 4 -path "*/lib/$MULTIARCH" -not -path "*original*" 2>/dev/null | head -1)
+        cache_lib=$(find "$CACHE_DIR" -maxdepth 4 -path "*/$KICAD_INSTALL_LIBDIR" -not -path "*original*" 2>/dev/null | head -1)
         [[ -n "$cache_lib" ]] || cache_lib=$(find "$CACHE_DIR" -maxdepth 3 -path "*/lib" -not -path "*original*" 2>/dev/null | head -1)
         cache_plugins="$cache_lib/kicad/plugins"
         cache_python="$(dirname "$cache_lib")/python3/dist-packages"
@@ -612,7 +642,7 @@ install_from_cache() {
     fi
 
     local cache_bin="$stage_root/bin"
-    local cache_lib="$stage_root/lib/$MULTIARCH"
+    local cache_lib="$stage_root/$KICAD_INSTALL_LIBDIR"
     [[ -d "$cache_lib" ]] || cache_lib="$stage_root/lib"
     local cache_plugins="$cache_lib/kicad/plugins"
     local cache_python="$stage_root/lib/python3/dist-packages"
@@ -842,6 +872,20 @@ verify_installation() {
         ((resource_errors++))
     fi
 
+    local common_lib
+    common_lib=$(find "$SYSTEM_LIB_DIR" -maxdepth 1 -name 'libkicommon.so*' -type f 2>/dev/null | sort -V | tail -1)
+
+    if [[ -n "$common_lib" && -f "$common_lib" ]]; then
+        if grep -a -q "$CACHE_DIR" "$common_lib"; then
+            err "В libkicommon зашит путь к cache; KiCad будет искать ресурсы не в /usr/share/kicad"
+            ((resource_errors++))
+        elif grep -a -q "$KICAD_DATA_DIR" "$common_lib"; then
+            ok "Runtime data path: $KICAD_DATA_DIR"
+        else
+            warn "Не удалось подтвердить runtime data path в $(basename "$common_lib")"
+        fi
+    fi
+
     [[ $resource_errors -eq 0 ]] || die "Проверка KiCad runtime-ресурсов не пройдена"
 
     # 3. Функциональный тест — импорт тестового файла
@@ -889,6 +933,12 @@ patches_hash=$hash
 patch_dir=$patch_dir
 cache_format=$CACHE_FORMAT_VERSION
 install_prefix=$KICAD_INSTALL_PREFIX
+install_libdir=$KICAD_INSTALL_LIBDIR
+kicad_data=$KICAD_DATA_DIR
+kicad_library_data=$KICAD_LIBRARY_DATA_DIR
+kicad_docs=$KICAD_DOCS_DIR
+kicad_lib=$KICAD_LIB_DIR
+kicad_user_plugin=$KICAD_USER_PLUGIN_DIR
 multiarch=$MULTIARCH
 built=$(date -Iseconds)
 builder=$(gcc --version 2>/dev/null | head -1)
