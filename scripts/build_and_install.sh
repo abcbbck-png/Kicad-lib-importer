@@ -31,10 +31,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PATCHES_DIR="$PROJECT_DIR/patches"
 CACHE_DIR="${CACHE_DIR:-$PROJECT_DIR/cache}"
+SOURCE_CACHE_DIR="${SOURCE_CACHE_DIR:-$CACHE_DIR/sources}"
 SRC_DIR="${SRC_DIR:-$PROJECT_DIR/kicad-src}"
 KICAD_REPO="${KICAD_REPO:-https://gitlab.com/kicad/code/kicad.git}"
+KICAD_SOURCE_URL_TEMPLATE="${KICAD_SOURCE_URL_TEMPLATE:-https://gitlab.com/kicad/code/kicad/-/archive/%VERSION%/kicad-%VERSION%.tar.gz}"
 JOBS=$(nproc 2>/dev/null || echo 4)
-CACHE_FORMAT_VERSION=4
+CACHE_FORMAT_VERSION=5
 KICAD_INSTALL_PREFIX="${KICAD_INSTALL_PREFIX:-/usr}"
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
 KICAD_INSTALL_LIBDIR="${KICAD_INSTALL_LIBDIR:-lib/$MULTIARCH}"
@@ -100,6 +102,10 @@ show_help() {
   KICAD_REPO   URL репозитория (по умолчанию: gitlab.com/kicad/code/kicad.git)
   SRC_DIR      Путь к исходникам KiCad (по умолчанию: ./kicad-src/)
   CACHE_DIR    Путь к кэшу (по умолчанию: ./cache/)
+  SOURCE_CACHE_DIR
+               Путь к кэшу исходных архивов (по умолчанию: ./cache/sources/)
+  KICAD_SOURCE_URL_TEMPLATE
+               URL-шаблон архива, %VERSION% заменяется версией KiCad
   KICAD_INSTALL_PREFIX
                Runtime prefix KiCad (по умолчанию: /usr)
   KICAD_INSTALL_LIBDIR
@@ -147,22 +153,29 @@ parse_args() {
 }
 
 # ── Определение версии KiCad ──────────────────────────────────────────────
-detect_kicad_version() {
-    # 1. Из dpkg (самый надёжный на Debian/Ubuntu)
+detect_dpkg_kicad_version() {
     if dpkg -s kicad &>/dev/null 2>&1; then
         local ver
         ver=$(dpkg-query -W -f='${Version}' kicad 2>/dev/null | sed 's/[+~].*//' | sed 's/-[0-9]*$//')
         [[ -n "$ver" ]] && echo "$ver" && return
     fi
 
-    # 2. Из kicad --version (если в PATH)
+    echo ""
+}
+
+detect_binary_kicad_version() {
+    if command -v kicad-cli &>/dev/null; then
+        local ver
+        ver=$(kicad-cli version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+        [[ -n "$ver" ]] && echo "$ver" && return
+    fi
+
     if command -v kicad &>/dev/null; then
         local ver
         ver=$(kicad --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
         [[ -n "$ver" ]] && echo "$ver" && return
     fi
 
-    # 3. Из пути к бинарнику
     local bin
     bin=$(find /usr/bin /usr/local/bin -name "kicad" -type f 2>/dev/null | head -1)
     if [[ -n "$bin" ]]; then
@@ -172,6 +185,22 @@ detect_kicad_version() {
     fi
 
     echo ""
+}
+
+detect_kicad_version() {
+    local ver
+    ver=$(detect_binary_kicad_version)
+    [[ -n "$ver" ]] && echo "$ver" && return
+
+    detect_dpkg_kicad_version
+}
+
+detect_restore_version() {
+    local ver
+    ver=$(detect_dpkg_kicad_version)
+    [[ -n "$ver" ]] && echo "$ver" && return
+
+    detect_binary_kicad_version
 }
 
 # ── Поиск патчей для версии ───────────────────────────────────────────────
@@ -232,6 +261,7 @@ compute_hash() {
         echo "kicad_docs=$KICAD_DOCS_DIR"
         echo "kicad_lib=$KICAD_LIB_DIR"
         echo "kicad_user_plugin=$KICAD_USER_PLUGIN_DIR"
+        echo "source_url_template=$KICAD_SOURCE_URL_TEMPLATE"
         list_patches "$patch_dir" | while IFS= read -r patch; do
             echo "patch=$(basename "$patch")"
             cat "$patch"
@@ -292,6 +322,14 @@ clean_cache() {
 
 # ── Определение пути установки системного KiCad ───────────────────────────
 find_system_kicad() {
+    local bin
+    bin=$(command -v kicad 2>/dev/null || true)
+
+    if [[ -n "$bin" && -f "$bin" ]]; then
+        dirname "$bin"
+        return
+    fi
+
     # Ищем директорию с .kiface файлами, исключая backup/cache/original папки
     local kiface
     kiface=$(find /usr -maxdepth 6 \
@@ -320,6 +358,8 @@ check_build_deps() {
         [git]=git
         [patch]=patch
         [python3]=python3
+        [curl]=curl
+        [tar]=tar
     )
 
     # Dev-библиотеки KiCad (проверяем через dpkg)
@@ -327,6 +367,7 @@ check_build_deps() {
         libprotobuf-dev
         protobuf-compiler
         libwxgtk3.2-dev
+        libwxgtk-webview3.2-dev
         libboost-all-dev
         libcairo2-dev
         libglew-dev
@@ -334,8 +375,14 @@ check_build_deps() {
         libcurl4-openssl-dev
         libssl-dev
         zlib1g-dev
+        libpoppler-dev
+        libpoppler-cpp-dev
+        libpoppler-glib-dev
         libfontconfig-dev
         libfreetype-dev
+        libharfbuzz-dev
+        libglm-dev
+        libspnav-dev
         python3-dev
         swig
         libocct-modeling-algorithms-dev
@@ -382,48 +429,82 @@ check_build_deps() {
 }
 
 # ── Подготовка исходников ─────────────────────────────────────────────────
+source_archive_path() {
+    local version="$1"
+    echo "$SOURCE_CACHE_DIR/kicad-$version.tar.gz"
+}
+
+source_archive_url() {
+    local version="$1"
+    echo "${KICAD_SOURCE_URL_TEMPLATE//%VERSION%/$version}"
+}
+
+assert_safe_source_dir() {
+    local src="$1"
+
+    [[ -n "$src" ]] || die "SRC_DIR пустой"
+    [[ "$src" != "/" ]] || die "Нельзя использовать SRC_DIR=/"
+    [[ "$src" != "$PROJECT_DIR" ]] || die "Нельзя удалять PROJECT_DIR как SRC_DIR"
+
+    case "$src" in
+        "$PROJECT_DIR"/kicad-src|"$PROJECT_DIR"/kicad-src-*) ;;
+        *)
+            die "SRC_DIR вне ожидаемой области проекта: $src\nЗадайте SRC_DIR внутри $PROJECT_DIR или подготовьте исходники вручную."
+            ;;
+    esac
+}
+
+download_source_archive() {
+    local version="$1"
+    local archive
+    archive=$(source_archive_path "$version")
+
+    mkdir -p "$SOURCE_CACHE_DIR"
+
+    if [[ -f "$archive" ]] && tar -tzf "$archive" >/dev/null 2>&1; then
+        ok "Архив исходников уже есть: $archive"
+        return
+    fi
+
+    local url
+    url=$(source_archive_url "$version")
+    log "Скачиваю исходники KiCad $version:"
+    log "$url"
+
+    rm -f "$archive.tmp"
+    curl -L --fail --show-error --progress-bar --output "$archive.tmp" "$url"
+    tar -tzf "$archive.tmp" >/dev/null 2>&1 || die "Скачанный архив повреждён: $archive.tmp"
+    mv -f "$archive.tmp" "$archive"
+    ok "Архив скачан: $archive"
+}
+
 prepare_source() {
     local version="$1"
 
     header "Исходники KiCad $version"
 
-    if [[ -d "$SRC_DIR/.git" ]]; then
-        ok "Репозиторий найден: $SRC_DIR"
+    assert_safe_source_dir "$SRC_DIR"
 
-        # Проверяем — может уже на нужном теге?
-        local current_tag
-        current_tag=$(git -C "$SRC_DIR" describe --tags --exact-match HEAD 2>/dev/null || echo "")
-        if [[ "$current_tag" == "$version" ]]; then
-            ok "Уже на теге $version"
-        else
-            log "Текущий тег: ${current_tag:-unknown}, нужен: $version"
-            log "Получение тега $version (только этот тег, без всей истории)..."
-            # Fetch только конкретного тега — не вешается как --tags на shallow-клоне
-            git -C "$SRC_DIR" fetch --depth 1 origin "refs/tags/$version:refs/tags/$version" --quiet 2>&1 | tail -2 || \
-            git -C "$SRC_DIR" fetch --depth 1 origin "$version" --quiet 2>&1 | tail -2 || true
-            git -C "$SRC_DIR" checkout "tags/$version" --quiet 2>/dev/null || \
-            git -C "$SRC_DIR" checkout "$version" --quiet || \
-                die "Тег $version не найден. Попробуйте: git -C kicad-src tag | grep '^9\.'"
-        fi
+    local archive tmp_dir extracted
+    archive=$(source_archive_path "$version")
+    download_source_archive "$version"
+    tmp_dir=$(mktemp -d "$PROJECT_DIR/.source-unpack.XXXXXX")
 
-        # Всегда сбрасываем рабочее дерево — патчи могли остаться с прошлого запуска
-        log "Сброс рабочего дерева на чистый $version..."
-        git -C "$SRC_DIR" reset --hard "tags/$version" --quiet 2>/dev/null || \
-        git -C "$SRC_DIR" reset --hard "$version" --quiet
-        git -C "$SRC_DIR" clean -fd --quiet
-        ok "Исходники чистые: $version"
-    else
-        log "Клонирование KiCad $version (это займёт время)..."
-        mkdir -p "$(dirname "$SRC_DIR")"
-        git clone \
-            --depth 1 \
-            --branch "$version" \
-            --recurse-submodules \
-            "$KICAD_REPO" \
-            "$SRC_DIR" \
-            2>&1 | grep -v "^remote:" | tail -5
-        ok "Исходники клонированы: $SRC_DIR"
+    log "Распаковка архива..."
+    tar -xzf "$archive" -C "$tmp_dir"
+
+    extracted="$tmp_dir/kicad-$version"
+    [[ -d "$extracted" ]] || die "В архиве не найдена директория kicad-$version"
+
+    if [[ -d "$SRC_DIR" ]]; then
+        warn "Удаляю старые исходники: $SRC_DIR"
+        rm -rf -- "$SRC_DIR"
     fi
+
+    mv "$extracted" "$SRC_DIR"
+    rm -rf -- "$tmp_dir"
+    printf "%s\n" "$version" > "$SRC_DIR/.kicad_source_version"
+    ok "Исходники готовы: $SRC_DIR"
 }
 
 # ── Применение патчей ─────────────────────────────────────────────────────
@@ -445,24 +526,29 @@ apply_patches() {
         name=$(basename "$p")
         printf "  ${DIM}%-50s${NC} " "$name"
 
-        local patch_args=(-p1 --directory="$src")
-        $dry && patch_args+=(--dry-run)
+        local check_args=(-p1 --directory="$src" --dry-run)
+        local apply_args=(-p1 --directory="$src" --forward)
 
-        if patch "${patch_args[@]}" < "$p" &>/dev/null 2>&1; then
-            echo -e "${GREEN}✓${NC}"
-        else
-            if patch -R -p1 --directory="$src" --dry-run < "$p" &>/dev/null 2>&1; then
-                echo -e "${YELLOW}уже применён${NC}"
-            elif $dry; then
-                echo -e "${RED}✗${NC}"
-                warn "Патч несовместим: $name"
-                warn "Возможно, версия KiCad не совпадает."
+        if patch "${check_args[@]}" < "$p" &>/dev/null 2>&1; then
+            if $dry; then
+                echo -e "${GREEN}✓${NC}"
+            elif patch "${apply_args[@]}" < "$p" &>/dev/null 2>&1; then
+                echo -e "${GREEN}✓${NC}"
             else
                 echo -e "${RED}✗${NC}"
-                # Попробуем показать детали
-                patch "${patch_args[@]}" < "$p" 2>&1 | tail -5 || true
-                die "Патч не применился: $name"
+                patch "${apply_args[@]}" < "$p" 2>&1 | tail -10 || true
+                die "Патч прошёл dry-run, но не применился: $name"
             fi
+        elif patch -R -p1 --directory="$src" --dry-run < "$p" &>/dev/null 2>&1; then
+            echo -e "${YELLOW}уже применён${NC}"
+        elif $dry; then
+            echo -e "${RED}✗${NC}"
+            warn "Патч несовместим: $name"
+            warn "Возможно, версия KiCad не совпадает."
+        else
+            echo -e "${RED}✗${NC}"
+            patch -p1 --directory="$src" --dry-run < "$p" 2>&1 | tail -10 || true
+            die "Патч не применился: $name"
         fi
     done
     echo ""
@@ -482,14 +568,15 @@ build_kicad() {
     echo ""
 
     local build_dir="$src/build"
+    local configure_log="$build_dir/configure.log"
+    local build_log="$build_dir/build.log"
+    local install_log="$build_dir/install.log"
 
-    if [[ -f "$build_dir/CMakeCache.txt" ]]; then
-        log "Очищаю старый CMakeCache, чтобы не сохранить прежние runtime-пути..."
-        rm -f "$build_dir/CMakeCache.txt"
-        rm -rf "$build_dir/CMakeFiles"
-    fi
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir"
 
     log "Конфигурация CMake..."
+    set +e
     cmake -S "$src" -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$KICAD_INSTALL_PREFIX" \
@@ -509,21 +596,31 @@ build_kicad() {
         -DKICAD_BUILD_QA_TESTS=OFF \
         -DKICAD_USE_CMAKE_FINDPROTOBUF=ON \
         -GNinja \
-        2>&1 | grep -E "(CMake Warning|CMake Error|-- Build|-- Install|error:)" | head -30
+        2>&1 | tee "$configure_log" | grep -E "(CMake Warning|CMake Error|-- Build|-- Install|-- Configuring|-- Generating|error:)"
+    local cmake_status=${PIPESTATUS[0]}
+    set -e
+    [[ $cmake_status -eq 0 ]] || { tail -120 "$configure_log"; die "CMake configure failed. Лог: $configure_log"; }
     ok "CMake настроен"
 
     log "Сборка (это займёт 30-60 минут)..."
     local start=$SECONDS
+    set +e
     cmake --build "$build_dir" -j "$JOBS" 2>&1 | \
-        grep -E "^\[|error:|warning:.*error" | \
-        awk 'NR%50==0 || /error/' | \
-        head -200
+        tee "$build_log" | \
+        awk '/^\[/ { if( NR % 80 == 0 ) print } /FAILED|error:|undefined reference|fatal:/ { print }'
+    local build_status=${PIPESTATUS[0]}
+    set -e
+    [[ $build_status -eq 0 ]] || { tail -160 "$build_log"; die "Сборка не удалась. Лог: $build_log"; }
     local elapsed=$(( SECONDS - start ))
     ok "Сборка завершена за $(( elapsed / 60 ))м $(( elapsed % 60 ))с"
 
     log "Установка в staging-кэш..."
     rm -rf "$stage_dir$KICAD_INSTALL_PREFIX"
-    DESTDIR="$stage_dir" cmake --install "$build_dir" 2>&1 | grep -v "^-- Up-to-date" | tail -20
+    set +e
+    DESTDIR="$stage_dir" cmake --install "$build_dir" 2>&1 | tee "$install_log" | grep -v "^-- Up-to-date"
+    local install_status=${PIPESTATUS[0]}
+    set -e
+    [[ $install_status -eq 0 ]] || { tail -120 "$install_log"; die "Staging install failed. Лог: $install_log"; }
     ok "Установлено в: $stage_dir$KICAD_INSTALL_PREFIX"
 
     log "Stripping символов (как в релизных пакетах Ubuntu)..."
@@ -575,7 +672,7 @@ backup_originals() {
         log "Бэкап бинарей из: $system_kicad"
         for f in "$cache_bin"/*; do
             local name; name=$(basename "$f")
-            [[ -f "$system_kicad/$name" && ! -e "$backup_dir/bin/$name" ]] \
+            [[ -f "$system_kicad/$name" && ! -e "$backup_dir/bin/$name" && ! -L "$backup_dir/bin/$name" ]] \
                 && cp -v "$system_kicad/$name" "$backup_dir/bin/"
         done
     fi
@@ -586,7 +683,8 @@ backup_originals() {
         for f in "$cache_lib"/libki*.so*; do
             [[ -e "$f" || -L "$f" ]] || continue
             local name; name=$(basename "$f")
-            [[ ( -e "$SYSTEM_LIB_DIR/$name" || -L "$SYSTEM_LIB_DIR/$name" ) && ! -e "$backup_dir/lib/$name" ]] \
+            [[ ( -e "$SYSTEM_LIB_DIR/$name" || -L "$SYSTEM_LIB_DIR/$name" )
+                    && ! -e "$backup_dir/lib/$name" && ! -L "$backup_dir/lib/$name" ]] \
                 && cp -av "$SYSTEM_LIB_DIR/$name" "$backup_dir/lib/"
         done
     fi
@@ -599,7 +697,7 @@ backup_originals() {
             local dst="$backup_dir/plugins/$rel"
             [[ -e "$sys_file" || -L "$sys_file" ]] || continue
             mkdir -p "$(dirname "$dst")"
-            [[ ! -e "$dst" ]] && cp -av "$sys_file" "$dst"
+            [[ ! -e "$dst" && ! -L "$dst" ]] && cp -av "$sys_file" "$dst"
         done < <(find "$cache_plugins" -type f -print0)
     fi
 
@@ -609,7 +707,7 @@ backup_originals() {
             [[ -e "$f" ]] || continue
             local name; name=$(basename "$f")
             local sys_file="/usr/lib/python3/dist-packages/$name"
-            [[ -e "$sys_file" && ! -e "$backup_dir/python/$name" ]] \
+            [[ -e "$sys_file" && ! -e "$backup_dir/python/$name" && ! -L "$backup_dir/python/$name" ]] \
                 && cp -av "$sys_file" "$backup_dir/python/"
         done
     fi
@@ -650,21 +748,19 @@ install_from_cache() {
 
     [[ -d "$cache_bin" ]] || die "В кэше нет директории bin: $cache_bin"
 
-    # Бинари: всё что есть в cache/bin/ и совпадает с системными файлами
+    # Бинари и .kiface: ставим весь staged bin поверх системного /usr/bin.
     local bin_files=()
     for f in "$cache_bin"/*; do
-        local name; name=$(basename "$f")
-        [[ -f "$system_kicad/$name" ]] && bin_files+=("$f")
+        [[ -e "$f" || -L "$f" ]] && bin_files+=("$f")
     done
-    [[ ${#bin_files[@]} -gt 0 ]] || die "Нет совпадений в $system_kicad"
+    [[ ${#bin_files[@]} -gt 0 ]] || die "В staged bin нет файлов: $cache_bin"
 
     # Shared libs: libki*.so* из cache/lib/ → /usr/lib/x86_64-linux-gnu/
     local lib_files=()
     if [[ -d "$cache_lib" ]]; then
         for f in "$cache_lib"/libki*.so*; do
             [[ -e "$f" || -L "$f" ]] || continue
-            local name; name=$(basename "$f")
-            [[ -e "$SYSTEM_LIB_DIR/$name" || -L "$SYSTEM_LIB_DIR/$name" ]] && lib_files+=("$f")
+            lib_files+=("$f")
         done
     fi
 
@@ -680,9 +776,9 @@ install_from_cache() {
 
     local share_dirs=()
     if [[ -d "$cache_share/kicad" ]]; then
-        for d in internat resources schemas scripting template plugins; do
-            [[ -d "$cache_share/kicad/$d" ]] && share_dirs+=("$d")
-        done
+        while IFS= read -r -d '' d; do
+            share_dirs+=("$(basename "$d")")
+        done < <(find "$cache_share/kicad" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
     fi
 
     log "Будет установлено бинарей:      ${#bin_files[@]} → $system_kicad"
@@ -731,7 +827,7 @@ install_from_cache() {
         sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad"
         for d in "${share_dirs[@]}"; do
             sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad/$d"
-            sudo cp -av "$cache_share/kicad/$d/." "$SYSTEM_SHARE_DIR/kicad/$d/"
+            sudo cp -a "$cache_share/kicad/$d/." "$SYSTEM_SHARE_DIR/kicad/$d/"
         done
     fi
     if [[ ${#lib_files[@]} -gt 0 || ${#plugin_files[@]} -gt 0 ]]; then
@@ -830,6 +926,22 @@ verify_installation() {
     fi
     ok "kicad-cli: $cli"
 
+    local verify_home
+    verify_home=$(mktemp -d /tmp/kicad-verify.XXXXXX)
+    mkdir -p "$verify_home/config" "$verify_home/cache" "$verify_home/data"
+    local cli_env=( env
+        XDG_CONFIG_HOME="$verify_home/config"
+        XDG_CACHE_HOME="$verify_home/cache"
+        XDG_DATA_HOME="$verify_home/data" )
+
+    local cli_version
+    cli_version=$("${cli_env[@]}" "$cli" version 2>&1 | tail -1 || true)
+    if [[ "$cli_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        ok "Версия kicad-cli: $cli_version"
+    else
+        warn "Не удалось уверенно прочитать версию kicad-cli: $cli_version"
+    fi
+
     # 2. Проверяем что .kiface файлы — валидные ELF
     local bad=0
     for f in "$system_kicad"/*.kiface; do
@@ -897,7 +1009,7 @@ verify_installation() {
     if [[ -f "$test_file" ]]; then
         printf "  %-40s " "Altium import (Attiny-test.SchLib)..."
         local result
-        result=$("$cli" sym upgrade "$test_file" -o /dev/null --force 2>&1) || true
+        result=$("${cli_env[@]}" "$cli" sym upgrade "$test_file" -o /dev/null --force 2>&1) || true
         if echo "$result" | grep -qiE "(error|crash|exception|Unable to convert)"; then
             echo -e "${RED}✗${NC}"
             warn "Вывод: $(echo "$result" | grep -iE "(error|crash)" | head -3)"
@@ -912,7 +1024,7 @@ verify_installation() {
     if [[ -f "$nullbyte_file" ]]; then
         printf "  %-40s " "Null-byte bug (test_bug_nullbyte.SchLib)..."
         local result
-        result=$("$cli" sym upgrade "$nullbyte_file" -o /dev/null --force 2>&1) || true
+        result=$("${cli_env[@]}" "$cli" sym upgrade "$nullbyte_file" -o /dev/null --force 2>&1) || true
         if echo "$result" | grep -qiE "(error|crash|exception|out of range)"; then
             echo -e "${RED}✗${NC}"
             warn "Null-byte баг всё ещё присутствует или новая ошибка"
@@ -921,6 +1033,7 @@ verify_installation() {
         fi
     fi
 
+    rm -rf "$verify_home"
     ok "Верификация завершена"
 }
 
@@ -939,6 +1052,7 @@ kicad_library_data=$KICAD_LIBRARY_DATA_DIR
 kicad_docs=$KICAD_DOCS_DIR
 kicad_lib=$KICAD_LIB_DIR
 kicad_user_plugin=$KICAD_USER_PLUGIN_DIR
+source_url_template=$KICAD_SOURCE_URL_TEMPLATE
 multiarch=$MULTIARCH
 built=$(date -Iseconds)
 builder=$(gcc --version 2>/dev/null | head -1)
@@ -965,8 +1079,13 @@ main() {
         version="$KICAD_VERSION_OVERRIDE"
         log "Версия задана явно: $version"
     else
-        log "Определяю версию установленного KiCad..."
-        version=$(detect_kicad_version)
+        if $MODE_RESTORE; then
+            log "Определяю пакетную версию KiCad для отката..."
+            version=$(detect_restore_version)
+        else
+            log "Определяю версию установленного KiCad..."
+            version=$(detect_kicad_version)
+        fi
         [[ -n "$version" ]] || die "KiCad не найден. Используйте --version X.X.X"
         ok "Найден KiCad $version"
     fi

@@ -24,13 +24,15 @@ __pycache__/
 
 # ── KiCad исходники (большие, скачиваются скриптом) ──
 /kicad-src/
+/kicad-src-*/
+/.source-unpack.*/
 
 # ── Кэш собранных артефактов ──
 # Хранится в cache/, но .kiface.meta оставляем для информации
 cache/kicad-*/
+cache/sources/
 # Старый формат кэша (один файл) — оставляем
 !cache/_eeschema.kiface.*
 
 # ── Бэкап оригинальных системных файлов ──
 cache/*-original/
-
