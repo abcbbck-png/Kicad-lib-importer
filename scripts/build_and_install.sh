@@ -121,6 +121,55 @@ show_help() {
 EOF
 }
 
+# ── Установка базового KiCad из apt (если не установлен) ─────────────────
+install_kicad_base_if_needed() {
+    local version="$1"
+
+    # Проверяем: есть ли уже установленный KiCad нужной версии
+    local installed
+    installed=$(dpkg-query -W -f='${Version}' kicad 2>/dev/null | sed 's/[+~].*//' | sed 's/-[0-9]*$//' || true)
+
+    if [[ "$installed" == "$version" ]]; then
+        ok "KiCad $version уже установлен"
+        return
+    fi
+
+    if [[ -n "$installed" ]]; then
+        warn "Установлен KiCad $installed, нужен $version"
+    else
+        warn "KiCad не установлен"
+    fi
+
+    # Найти подходящую apt-версию
+    local apt_ver
+    apt_ver=$(apt-cache madison kicad 2>/dev/null \
+        | awk -F'|' '{gsub(/ /,"",$2); print $2}' \
+        | grep "^${version}" \
+        | head -1)
+
+    if [[ -z "$apt_ver" ]]; then
+        warn "В apt нет точной версии $version. Устанавливаем кандидата..."
+        apt_ver=""  # apt сам выберет
+    fi
+
+    log "Устанавливаю KiCad из apt (версия: ${apt_ver:-авто})..."
+
+    local pkg_spec="kicad"
+    [[ -n "$apt_ver" ]] && pkg_spec="kicad=${apt_ver}"
+
+    sudo apt-get install -y \
+        "$pkg_spec" \
+        kicad-footprints \
+        kicad-symbols \
+        kicad-templates \
+        kicad-packages3d \
+        2>&1 | grep -E "^(Получение|Get|Распаковка|Unpacking|Настройка|Setting up|E:|Err:)" | head -60
+
+    local new_installed
+    new_installed=$(dpkg-query -W -f='${Version}' kicad 2>/dev/null || true)
+    ok "KiCad установлен: $new_installed"
+}
+
 # ── Проверка что не запущен как root ────────────────────────────────────
 check_not_root() {
     if [[ $EUID -eq 0 ]]; then
@@ -1097,6 +1146,11 @@ main() {
         [[ -n "$system_kicad" ]] || die "Системная директория KiCad не найдена"
         restore_originals "$version" "$system_kicad"
         exit 0
+    fi
+
+    # ── 2.5. Убедиться что базовый KiCad установлен ──
+    if ! $MODE_CHECK; then
+        install_kicad_base_if_needed "$version"
     fi
 
     # ── 3. Найти патчи ──
