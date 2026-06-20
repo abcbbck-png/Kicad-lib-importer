@@ -13,6 +13,9 @@
 #   ./scripts/build_and_install.sh --check            # dry-run, ничего не меняет
 #   ./scripts/build_and_install.sh --from-cache       # только из кэша (без сборки)
 #   ./scripts/build_and_install.sh --rebuild          # пересобрать, игнорируя кэш
+#   ./scripts/build_and_install.sh --build-only       # собрать в кэш без установки
+#   ./scripts/build_and_install.sh --update-libraries # обновить официальные библиотеки KiCad через apt
+#   ./scripts/build_and_install.sh -v 10.0.4 --rebuild # мягко обновить KiCad до 10.0.4
 #   ./scripts/build_and_install.sh --restore          # откат к оригинальным файлам
 #   ./scripts/build_and_install.sh --list-cache       # показать кэш
 #   ./scripts/build_and_install.sh --clean-cache      # очистить кэш
@@ -47,13 +50,25 @@ KICAD_LIB_DIR="${KICAD_LIB_DIR:-$KICAD_INSTALL_PREFIX/$KICAD_INSTALL_LIBDIR}"
 KICAD_USER_PLUGIN_DIR="${KICAD_USER_PLUGIN_DIR:-$KICAD_LIB_DIR/kicad/plugins}"
 SYSTEM_LIB_DIR="/usr/lib/$MULTIARCH"
 SYSTEM_SHARE_DIR="/usr/share"
+KICAD_OFFICIAL_LIBRARY_PACKAGES=(kicad-symbols kicad-footprints kicad-templates kicad-packages3d)
 
 # ── Режимы ────────────────────────────────────────────────────────────────
 MODE_CHECK=false        # dry-run
 MODE_FROM_CACHE=false   # только из кэша
 MODE_REBUILD=false      # игнорировать кэш
 MODE_RESTORE=false      # откат
+MODE_BUILD_ONLY=false   # собрать в кэш без установки
+MODE_UPDATE_LIBRARIES=false # обновить official library packages через apt
 KICAD_VERSION_OVERRIDE=""
+PATCH_CHECK_SRC=""
+PATCH_CHECK_TMP=""
+
+cleanup_tmp() {
+    [[ -n "${PATCH_CHECK_TMP:-}" && -d "$PATCH_CHECK_TMP" ]] && rm -rf -- "$PATCH_CHECK_TMP"
+    return 0
+}
+
+trap cleanup_tmp EXIT
 
 # ── Утилиты ───────────────────────────────────────────────────────────────
 log()    { echo -e "${CYAN}[INFO]${NC} $*"; }
@@ -64,13 +79,21 @@ die()    { err "$*"; exit 1; }
 header() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 ask()    { echo -e "${YELLOW}[?]${NC} $*"; }
 
+run_sudo() {
+    if [[ -n "${SUDO_ASKPASS:-}" && ! -t 0 ]]; then
+        sudo -A "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 sudo_atomic_copy() {
     local src="$1" dst="$2" tmp
     tmp="${dst}.tmp.$$"
 
-    sudo rm -f "$tmp"
-    sudo cp -aP "$src" "$tmp"
-    sudo mv -f "$tmp" "$dst"
+    run_sudo rm -f "$tmp"
+    run_sudo cp -aP "$src" "$tmp"
+    run_sudo mv -f "$tmp" "$dst"
 }
 
 # ── Помощь ────────────────────────────────────────────────────────────────
@@ -92,6 +115,8 @@ show_help() {
   --check              Dry-run: показать план, ничего не менять
   --from-cache         Установить из кэша без пересборки
   --rebuild            Принудительная пересборка (игнорировать кэш)
+  --build-only         Собрать staged-кэш без установки в систему
+  --update-libraries   Обновить official library packages KiCad через apt
   --restore            Откат к оригинальным системным файлам
   --list-cache         Показать доступные кэшированные сборки
   --clean-cache        Удалить все кэшированные сборки
@@ -115,6 +140,14 @@ show_help() {
   ./scripts/build_and_install.sh --check         # что будет установлено?
   ./scripts/build_and_install.sh                 # полная сборка + установка
   ./scripts/build_and_install.sh --from-cache    # быстрая установка из кэша
+  ./scripts/build_and_install.sh -v 10.0.4 --check
+                                                # проверить патчи на чистой 10.0.4
+  ./scripts/build_and_install.sh -v 10.0.4 --build-only --rebuild
+                                                # собрать 10.0.4 в кэш без sudo
+  ./scripts/build_and_install.sh -v 10.0.4 --from-cache --update-libraries
+                                                # обновить библиотеки и поставить кэш
+  ./scripts/build_and_install.sh -v 10.0.4 --rebuild
+                                                # собрать и установить 10.0.4 с патчами
   ./scripts/build_and_install.sh --restore       # откат
   ./scripts/build_and_install.sh -v 9.0.7 -j 16 # явная версия, 16 потоков
 
@@ -135,7 +168,9 @@ install_kicad_base_if_needed() {
     fi
 
     if [[ -n "$installed" ]]; then
-        warn "Установлен KiCad $installed, нужен $version"
+        warn "Установлен KiCad $installed, целевая сборка $version"
+        warn "Базовый пакет apt не меняю: версия будет обновлена staged-сборкой из исходников."
+        return
     else
         warn "KiCad не установлен"
     fi
@@ -157,7 +192,7 @@ install_kicad_base_if_needed() {
     local pkg_spec="kicad"
     [[ -n "$apt_ver" ]] && pkg_spec="kicad=${apt_ver}"
 
-    sudo apt-get install -y \
+    run_sudo apt-get install -y \
         "$pkg_spec" \
         kicad-footprints \
         kicad-symbols \
@@ -168,6 +203,71 @@ install_kicad_base_if_needed() {
     local new_installed
     new_installed=$(dpkg-query -W -f='${Version}' kicad 2>/dev/null || true)
     ok "KiCad установлен: $new_installed"
+}
+
+apt_version_for_package() {
+    local pkg="$1" version="$2"
+
+    apt-cache madison "$pkg" 2>/dev/null \
+        | awk -F'|' '{gsub(/ /,"",$2); print $2}' \
+        | grep "^${version}" \
+        | head -1
+}
+
+installed_package_version() {
+    local pkg="$1"
+
+    dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true
+}
+
+report_library_packages() {
+    local version="$1"
+
+    header "Official KiCad library packages"
+    for pkg in "${KICAD_OFFICIAL_LIBRARY_PACKAGES[@]}"; do
+        local installed available
+        installed=$(installed_package_version "$pkg")
+        available=$(apt_version_for_package "$pkg" "$version")
+
+        if [[ -n "$available" ]]; then
+            printf "  %-20s installed=%-24s target=%s\n" "$pkg" "${installed:-нет}" "$available"
+        else
+            printf "  %-20s installed=%-24s target=%s\n" "$pkg" "${installed:-нет}" "нет в apt для $version"
+        fi
+    done
+    echo ""
+}
+
+update_library_packages_if_requested() {
+    local version="$1"
+
+    if ! $MODE_UPDATE_LIBRARIES; then
+        return
+    fi
+
+    report_library_packages "$version"
+
+    local specs=()
+    for pkg in "${KICAD_OFFICIAL_LIBRARY_PACKAGES[@]}"; do
+        local apt_ver
+        apt_ver=$(apt_version_for_package "$pkg" "$version")
+
+        if [[ -n "$apt_ver" ]]; then
+            specs+=("$pkg=$apt_ver")
+        else
+            warn "Для $pkg нет apt-версии $version; пакет пропущен"
+        fi
+    done
+
+    [[ ${#specs[@]} -gt 0 ]] || die "Нет доступных library packages для KiCad $version"
+
+    log "Обновляю official library packages через apt:"
+    for spec in "${specs[@]}"; do
+        echo "    $spec"
+    done
+
+    run_sudo apt-get install -y "${specs[@]}"
+    ok "Official library packages обновлены"
 }
 
 # ── Проверка что не запущен как root ────────────────────────────────────
@@ -191,6 +291,8 @@ parse_args() {
             --check)       MODE_CHECK=true; shift ;;
             --from-cache)  MODE_FROM_CACHE=true; shift ;;
             --rebuild)     MODE_REBUILD=true; shift ;;
+            --build-only)  MODE_BUILD_ONLY=true; shift ;;
+            --update-libraries) MODE_UPDATE_LIBRARIES=true; shift ;;
             --restore)     MODE_RESTORE=true; shift ;;
             --list-cache)  list_cache; exit 0 ;;
             --clean-cache) clean_cache; exit 0 ;;
@@ -473,7 +575,7 @@ check_build_deps() {
     fi
 
     log "Установка зависимостей..."
-    sudo apt-get install -y --fix-missing "${all_missing[@]}" 2>&1 | grep -E "^(Get|Unpacking|Setting up|E:)" | head -40
+    run_sudo apt-get install -y --fix-missing "${all_missing[@]}" 2>&1 | grep -E "^(Get|Unpacking|Setting up|E:)" | head -40
     ok "Зависимости установлены"
 }
 
@@ -554,6 +656,35 @@ prepare_source() {
     rm -rf -- "$tmp_dir"
     printf "%s\n" "$version" > "$SRC_DIR/.kicad_source_version"
     ok "Исходники готовы: $SRC_DIR"
+}
+
+source_dir_version() {
+    local src="$1"
+
+    [[ -f "$src/.kicad_source_version" ]] || return 1
+    tr -d '[:space:]' < "$src/.kicad_source_version"
+}
+
+prepare_patch_check_source() {
+    local version="$1"
+    local check_src="$SRC_DIR"
+
+    if [[ -d "$check_src" && "$(source_dir_version "$check_src" 2>/dev/null || true)" == "$version" ]]; then
+        log "Dry-run использует текущие исходники: $check_src"
+        PATCH_CHECK_SRC="$check_src"
+        PATCH_CHECK_TMP=""
+        return
+    fi
+
+    header "Исходники для dry-run KiCad $version"
+    download_source_archive "$version"
+
+    PATCH_CHECK_TMP=$(mktemp -d /tmp/kicad-patch-check.XXXXXX)
+    log "Распаковка во временный каталог: $PATCH_CHECK_TMP"
+    tar -xzf "$(source_archive_path "$version")" -C "$PATCH_CHECK_TMP"
+
+    PATCH_CHECK_SRC="$PATCH_CHECK_TMP/kicad-$version"
+    [[ -d "$PATCH_CHECK_SRC" ]] || die "В архиве не найдена директория kicad-$version"
 }
 
 # ── Применение патчей ─────────────────────────────────────────────────────
@@ -673,11 +804,12 @@ build_kicad() {
     ok "Установлено в: $stage_dir$KICAD_INSTALL_PREFIX"
 
     log "Stripping символов (как в релизных пакетах Ubuntu)..."
-    find "$stage_dir$KICAD_INSTALL_PREFIX" -type f \( -name "*.kiface" -o -name "*.so" -o -name "*.so.*" \
+    while IFS= read -r -d '' f; do
+        file "$f" | grep -q "ELF" && strip --strip-unneeded "$f"
+    done < <(find "$stage_dir$KICAD_INSTALL_PREFIX" -type f \( -name "*.kiface" -o -name "*.so" -o -name "*.so.*" \
         -o -name "kicad" -o -name "kicad-cli" -o -name "eeschema" -o -name "pcbnew" \
         -o -name "gerbview" -o -name "pcb_calculator" -o -name "pl_editor" \
-        -o -name "bitmap2component" \) \
-        -exec strip --strip-unneeded {} \;
+        -o -name "bitmap2component" \) -print0)
     ok "Символы удалены (размер файлов уменьшен)"
 }
 
@@ -859,28 +991,28 @@ install_from_cache() {
         done
     fi
     if [[ ${#plugin_files[@]} -gt 0 ]]; then
-        sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins"
+        run_sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins"
         for f in "${plugin_files[@]}"; do
             local rel="${f#$cache_plugins/}"
-            sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins/$(dirname "$rel")"
+            run_sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins/$(dirname "$rel")"
             sudo_atomic_copy "$f" "$SYSTEM_LIB_DIR/kicad/plugins/$rel"
         done
     fi
     if [[ ${#python_files[@]} -gt 0 ]]; then
-        sudo mkdir -p /usr/lib/python3/dist-packages
+        run_sudo mkdir -p /usr/lib/python3/dist-packages
         for f in "${python_files[@]}"; do
             sudo_atomic_copy "$f" "/usr/lib/python3/dist-packages/$(basename "$f")"
         done
     fi
     if [[ ${#share_dirs[@]} -gt 0 ]]; then
-        sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad"
+        run_sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad"
         for d in "${share_dirs[@]}"; do
-            sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad/$d"
-            sudo cp -a "$cache_share/kicad/$d/." "$SYSTEM_SHARE_DIR/kicad/$d/"
+            run_sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad/$d"
+            run_sudo cp -a "$cache_share/kicad/$d/." "$SYSTEM_SHARE_DIR/kicad/$d/"
         done
     fi
     if [[ ${#lib_files[@]} -gt 0 || ${#plugin_files[@]} -gt 0 ]]; then
-        sudo ldconfig
+        run_sudo ldconfig
     fi
     ok "Установка завершена"
 }
@@ -915,7 +1047,7 @@ restore_originals() {
             echo "'$f' -> '$SYSTEM_LIB_DIR/$(basename "$f")'"
             sudo_atomic_copy "$f" "$SYSTEM_LIB_DIR/$(basename "$f")"
         done
-        sudo ldconfig
+        run_sudo ldconfig
     fi
 
     if [[ -d "$backup_dir/plugins" ]]; then
@@ -925,10 +1057,10 @@ restore_originals() {
             log "Восстановление plugins → $SYSTEM_LIB_DIR/kicad/plugins"
             for f in "${plugin_files[@]}"; do
                 local rel="${f#$backup_dir/plugins/}"
-                sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins/$(dirname "$rel")"
+                run_sudo mkdir -p "$SYSTEM_LIB_DIR/kicad/plugins/$(dirname "$rel")"
                 sudo_atomic_copy "$f" "$SYSTEM_LIB_DIR/kicad/plugins/$rel"
             done
-            sudo ldconfig
+            run_sudo ldconfig
         fi
     fi
 
@@ -950,8 +1082,8 @@ restore_originals() {
             log "Восстановление share/kicad resources"
             for d in "${share_dirs[@]}"; do
                 local name; name=$(basename "$d")
-                sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad/$name"
-                sudo cp -av "$d/." "$SYSTEM_SHARE_DIR/kicad/$name/"
+                run_sudo mkdir -p "$SYSTEM_SHARE_DIR/kicad/$name"
+                run_sudo cp -av "$d/." "$SYSTEM_SHARE_DIR/kicad/$name/"
             done
         fi
     fi
@@ -962,7 +1094,7 @@ restore_originals() {
 
 # ── Верификация установки ─────────────────────────────────────────────────
 verify_installation() {
-    local system_kicad="$1"
+    local system_kicad="$1" expected_version="${2:-}"
 
     header "Верификация"
 
@@ -987,6 +1119,10 @@ verify_installation() {
     cli_version=$("${cli_env[@]}" "$cli" version 2>&1 | tail -1 || true)
     if [[ "$cli_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         ok "Версия kicad-cli: $cli_version"
+
+        if [[ -n "$expected_version" && "$cli_version" != "$expected_version"* ]]; then
+            die "После установки ожидалась версия $expected_version, но kicad-cli показывает: $cli_version"
+        fi
     else
         warn "Не удалось уверенно прочитать версию kicad-cli: $cli_version"
     fi
@@ -1116,6 +1252,10 @@ main() {
     parse_args "$@"
     check_not_root
 
+    if $MODE_BUILD_ONLY && $MODE_UPDATE_LIBRARIES; then
+        die "--update-libraries несовместим с --build-only: сборка кэша не должна менять систему"
+    fi
+
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║         KiCad Patch Builder & Installer                  ║"
@@ -1149,8 +1289,10 @@ main() {
     fi
 
     # ── 2.5. Убедиться что базовый KiCad установлен ──
-    if ! $MODE_CHECK; then
+    if ! $MODE_CHECK && ! $MODE_BUILD_ONLY; then
         install_kicad_base_if_needed "$version"
+    elif $MODE_BUILD_ONLY; then
+        log "Режим build-only: базовый пакет apt и системная установка не изменяются"
     fi
 
     # ── 3. Найти патчи ──
@@ -1188,6 +1330,10 @@ main() {
         fi
     fi
 
+    if $MODE_FROM_CACHE && [[ ! -d "$cache_install" ]]; then
+        die "Кэш не найден: $cache_install\nСначала соберите: ./scripts/build_and_install.sh --version $version --build-only --rebuild"
+    fi
+
     # ── 6. Показать план (dry-run) ──
     if $MODE_CHECK; then
         header "План установки (dry-run)"
@@ -1197,16 +1343,25 @@ main() {
         echo "  Кэш:           $cache_install"
         [[ -d "$cache_install" ]] && echo "  Состояние кэша: ГОТОВ" || echo "  Состояние кэша: нужна сборка"
         echo ""
-        apply_patches "$SRC_DIR" "$patch_dir" true 2>/dev/null || true
+
+        prepare_patch_check_source "$version"
+        apply_patches "$PATCH_CHECK_SRC" "$patch_dir" true
+        $MODE_UPDATE_LIBRARIES && report_library_packages "$version"
+        [[ -n "$PATCH_CHECK_TMP" ]] && rm -rf -- "$PATCH_CHECK_TMP"
+
         warn "Dry-run завершён. Для реальной установки уберите --check"
         exit 0
     fi
 
     # ── 7. Определить системный путь KiCad ──
     local system_kicad
-    system_kicad=$(find_system_kicad)
-    [[ -n "$system_kicad" ]] || die "Системная директория KiCad не найдена"
-    log "Системный KiCad: $system_kicad"
+    if ! $MODE_BUILD_ONLY; then
+        system_kicad=$(find_system_kicad)
+        [[ -n "$system_kicad" ]] || die "Системная директория KiCad не найдена"
+        log "Системный KiCad: $system_kicad"
+    else
+        system_kicad=""
+    fi
 
     # ── 8. Собрать если нет в кэше ──
     if [[ ! -d "$cache_install" ]] || $MODE_REBUILD; then
@@ -1222,6 +1377,18 @@ main() {
         ok "Используем кэш (пересборка не нужна)"
     fi
 
+    if $MODE_BUILD_ONLY; then
+        ok "Сборка сохранена в кэше: $cache_install"
+        echo ""
+        echo "  Установка из кэша:"
+        echo "    ./scripts/build_and_install.sh --version $version --from-cache"
+        echo ""
+        exit 0
+    fi
+
+    # ── 8.5. Обновить official library packages ──
+    update_library_packages_if_requested "$version"
+
     # ── 9. Резервная копия ──
     backup_originals "$version" "$system_kicad" "$cache_install"
 
@@ -1229,7 +1396,7 @@ main() {
     install_from_cache "$cache_install" "$system_kicad"
 
     # ── 11. Верификация ──
-    verify_installation "$system_kicad"
+    verify_installation "$system_kicad" "$version"
 
     echo ""
     echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"

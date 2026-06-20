@@ -23,6 +23,32 @@
 |------|----------|
 | `local-patches-combined.diff` | Combined diff: 0001 + 0003 + 0004 + 0005 (без altium-null-byte — он уже в upstream) |
 
+## kicad-10.0.4/
+
+| Файл | Описание |
+|------|----------|
+| `local-patches-combined.diff` | Локальный слой проекта, проверенный на чистом архиве KiCad 10.0.4 |
+
+Проверить совместимость:
+```bash
+./scripts/build_and_install.sh --version 10.0.4 --check
+```
+
+Собрать в кэш без установки:
+```bash
+./scripts/build_and_install.sh --version 10.0.4 --build-only --rebuild
+```
+
+Установить из кэша:
+```bash
+./scripts/build_and_install.sh --version 10.0.4 --from-cache --update-libraries
+```
+
+Собрать и установить одним шагом:
+```bash
+./scripts/build_and_install.sh --version 10.0.4 --rebuild --update-libraries
+```
+
 ## standalone/
 
 Самостоятельные патчи, не привязанные к конкретной версии.

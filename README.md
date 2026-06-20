@@ -13,6 +13,7 @@
 | `0004-group-by-column` | 9.0.7 | ✅ работает | Группировка по колонке в дереве библиотек |
 | `0005-auto-bus-entry-posture-fix` | 9.0.7 | ✅ работает | Исправление posture для авто bus entry |
 | `local-patches-combined` | 9.0.8 | ✅ работает | Все патчи кроме altium-null-byte (уже в upstream) |
+| `local-patches-combined` | 10.0.4 | ✅ проверено | Локальный слой проекта, перебазированный на KiCad 10.0.4 |
 | `gost-font-multiline` | standalone | ✅ работает | Фикс integer truncation в `GetInterline()` для GOST-шрифтов |
 | `bus-entry-size-properties` | standalone | ✅ работает | Size X/Y в properties bus entry |
 
@@ -31,6 +32,29 @@
 # 4. Откат к оригинальному KiCad
 ./scripts/build_and_install.sh --restore
 ```
+
+## Обновление до KiCad 10.0.4
+
+```bash
+# Проверить, что локальные патчи ложатся на чистую 10.0.4
+./scripts/build_and_install.sh --version 10.0.4 --check
+
+# Собрать 10.0.4 с локальными патчами в кэш без установки
+./scripts/build_and_install.sh --version 10.0.4 --build-only --rebuild
+
+# Установить уже собранный кэш поверх текущего KiCad.
+# Флаг --update-libraries обновит official packages библиотек через apt,
+# если для них доступна версия 10.0.4.
+./scripts/build_and_install.sh --version 10.0.4 --from-cache --update-libraries
+
+# Либо одним шагом: собрать и установить поверх текущего KiCad
+./scripts/build_and_install.sh --version 10.0.4 --rebuild --update-libraries
+```
+
+При явном `--version` скрипт не требует, чтобы такая же версия уже была в apt:
+если KiCad установлен, базовый пакет сохраняется, а фактическая версия обновляется
+staged-сборкой из исходников. После установки `kicad-cli version` сверяется с
+целевой версией.
 
 ## Как работает build_and_install.sh
 
@@ -52,6 +76,7 @@
 patches/
   kicad-9.0.7/          # серия патчей для 9.0.7 (5 штук)
   kicad-9.0.8/          # combined diff для 9.0.8
+  kicad-10.0.4/         # combined diff для 10.0.4
   standalone/           # независимые патчи (gost, bus-entry)
 scripts/
   build_and_install.sh  # главный скрипт: патч → сборка → установка
